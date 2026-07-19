@@ -894,8 +894,8 @@ void updateStatsDisplay() {
   }
 
   drawTitleBarClock();
-  drawWifiIcon();
   drawTankGauge();
+  drawWifiIcon(ROW_Y(0));
   drawBatteryRow(ROW_Y(0));
   drawWaterRow(ROW_Y(1));
   drawHeardRow(ROW_Y(2));
