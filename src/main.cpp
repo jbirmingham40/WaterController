@@ -645,8 +645,12 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, 14 /* RST */, 1 /*rotation*/, 1 /*IPS
 #define PANEL_W (320 - PANEL_X - 4)
 #define ROW_H 20
 #define ROW_Y(n) (TITLEBAR_H + 4 + (n) * ROW_H)
-#define TITLE_WIFI_ICON_X 4 // leftmost in the title bar
-#define TITLE_LABEL_X 28 // 18px WiFi icon + a 6px gap, so "AUTOFILL" starts after it
+// Battery row layout, left to right: WiFi icon, Yes/No text, a wider gap
+// (so the two metrics read as visually distinct), then the battery icon+voltage.
+#define WIFI_ICON_X PANEL_X
+#define WIFI_TEXT_X (WIFI_ICON_X + 17)
+#define WIFI_TEXT_CHARS 3
+#define BATTERY_ICON_X (WIFI_TEXT_X + WIFI_TEXT_CHARS * 12 + 14)
 
 uint16_t batteryColor(float percentage) {
   if (percentage > 50) return RGB565_GREEN;
@@ -688,7 +692,7 @@ void drawDashboardChrome() {
   gfx->fillRect(0, 0, gfx->width(), TITLEBAR_H, RGB565_TEAL);
   gfx->setTextSize(2);
   gfx->setTextColor(RGB565_WHITE, RGB565_TEAL);
-  gfx->setCursor(TITLE_LABEL_X, 3);
+  gfx->setCursor(4, 3);
   gfx->print("AUTOFILL");
 
   gfx->drawRect(TANK_X, TANK_Y, TANK_W, TANK_H, RGB565_WHITE);
@@ -697,7 +701,7 @@ void drawDashboardChrome() {
   gfx->fillTriangle(PANEL_X, yDesired + 4, PANEL_X, yDesired + 14, PANEL_X + 8, yDesired + 9, RGB565_YELLOW);
 
   int yBatt = ROW_Y(0);
-  const int bodyX = PANEL_X, bodyY = yBatt + 4, bodyW = 28, bodyH = 12;
+  const int bodyX = BATTERY_ICON_X, bodyY = yBatt + 4, bodyW = 28, bodyH = 12;
   gfx->drawRect(bodyX, bodyY, bodyW, bodyH, RGB565_WHITE);
   gfx->fillRect(bodyX + bodyW, bodyY + 3, 3, bodyH - 6, RGB565_WHITE);
 }
@@ -710,12 +714,12 @@ void drawBatteryRow(int y) {
   lastVoltage = sensorVoltage;
   lastPercentage = sensorPercentage;
 
-  const int bodyX = PANEL_X, bodyY = y + 4, bodyW = 28, bodyH = 12;
+  const int bodyX = BATTERY_ICON_X, bodyY = y + 4, bodyW = 28, bodyH = 12;
   const int textX = bodyX + bodyW + 8;
 
   if (sensorVoltage < 0) {
     gfx->fillRect(bodyX + 2, bodyY + 2, bodyW - 4, bodyH - 4, RGB565_DARKGREY);
-    printPadded(textX, y + 2, RGB565_GRAY, RGB565_BLACK, 12, "?");
+    printPadded(textX, y + 2, RGB565_GRAY, RGB565_BLACK, 8, "?");
     return;
   }
 
@@ -725,8 +729,8 @@ void drawBatteryRow(int y) {
   gfx->fillRect(bodyX + 2, bodyY + 2, fillW, bodyH - 4, color);
 
   char buf[16];
-  snprintf(buf, sizeof(buf), "%.0f%% %.2fV", sensorPercentage, sensorVoltage);
-  printPadded(textX, y + 2, color, RGB565_BLACK, 12, buf);
+  snprintf(buf, sizeof(buf), "%.2fV", sensorVoltage);
+  printPadded(textX, y + 2, color, RGB565_BLACK, 8, buf);
 }
 
 void drawWaterRow(int y) {
@@ -801,29 +805,32 @@ void drawHeardRow(int y) {
   printPadded(PANEL_X, y + 2, color, RGB565_BLACK, 19, buf);
 }
 
-// Lives in the title bar, just before the "AUTOFILL" label: three ascending
-// bars in green when connected; the same bars in gray with a red slash
-// through them when not, so "disconnected" reads as a distinct icon, not
-// just a duller copy of the connected one.
-void drawWifiIcon() {
+// Shares the battery row, to its left: three ascending bars (green when
+// connected, gray with a red slash through them when not - a distinct icon,
+// not just a duller copy) followed by a Yes/No readout, then a wide gap
+// before the battery icon so the two metrics read as visually distinct.
+void drawWifiIcon(int y) {
   static int8_t lastWifi = -1;
   if ((int8_t)wifiConnected == lastWifi) {
     return;
   }
   lastWifi = wifiConnected;
 
-  const int x = TITLE_WIFI_ICON_X, y = 2;
-  gfx->fillRect(x, y, 18, 18, RGB565_TEAL); // clear - bars vs. bars+slash occupy different footprints
+  const int x = WIFI_ICON_X, top = y + 4;
+  gfx->fillRect(x, top, 13, 12, RGB565_BLACK); // clear - bars vs. bars+slash occupy different footprints
 
   uint16_t barColor = wifiConnected ? RGB565_GREEN : RGB565_DARKGREY;
-  gfx->fillRect(x, y + 10, 3, 6, barColor);
-  gfx->fillRect(x + 5, y + 6, 3, 10, barColor);
-  gfx->fillRect(x + 10, y + 2, 3, 14, barColor);
+  gfx->fillRect(x, top + 8, 3, 4, barColor);
+  gfx->fillRect(x + 5, top + 4, 3, 8, barColor);
+  gfx->fillRect(x + 10, top, 3, 12, barColor);
 
   if (!wifiConnected) {
-    gfx->drawLine(x, y + 1, x + 13, y + 15, RGB565_RED);
-    gfx->drawLine(x + 1, y + 1, x + 14, y + 15, RGB565_RED); // thicken the slash to 2px
+    gfx->drawLine(x, top, x + 12, top + 11, RGB565_RED);
+    gfx->drawLine(x + 1, top, x + 12, top + 10, RGB565_RED); // thicken the slash to 2px
   }
+
+  printPadded(WIFI_TEXT_X, y + 2, wifiConnected ? RGB565_GREEN : RGB565_GRAY, RGB565_BLACK,
+              WIFI_TEXT_CHARS, wifiConnected ? "Yes" : "No");
 }
 
 void drawTankGauge() {
