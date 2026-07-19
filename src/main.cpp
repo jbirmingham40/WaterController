@@ -97,14 +97,13 @@ static const uint8_t I2C_SDA_PIN = 18;
 static const uint8_t I2C_SCL_PIN = 8;
 
 // ===================== TCA9554 I2C GPIO expander (found at 0x20) =====================
-// EX0 (P0) drives the water valve relay; EX1 (P1) reads the freeze-protect
-// switch. Add more EX pins here as needed - all others stay inputs.
+// EX0 (P0) drives the water valve relay. Add more EX pins here as needed -
+// all others stay inputs.
 #define TCA9554_ADDR 0x20
 #define TCA9554_REG_INPUT 0x00
 #define TCA9554_REG_OUTPUT 0x01
 #define TCA9554_REG_CONFIG 0x03
-static const uint8_t RELAY_EXIO_BIT = 0;          // EX0 = P0
-static const uint8_t FREEZE_PROTECT_EXIO_BIT = 1; // EX1 = P1
+static const uint8_t RELAY_EXIO_BIT = 0; // EX0 = P0
 
 void tca9554WriteReg(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(TCA9554_ADDR);
@@ -115,7 +114,7 @@ void tca9554WriteReg(uint8_t reg, uint8_t value) {
 
 void relaySet(bool on) {
   // Config register: 1=input, 0=output. Only the relay's bit is an output;
-  // the rest (including the freeze-protect input) stay inputs.
+  // the rest stay inputs.
   uint8_t config = 0xFF & ~(1 << RELAY_EXIO_BIT);
   tca9554WriteReg(TCA9554_REG_CONFIG, config);
   tca9554WriteReg(TCA9554_REG_OUTPUT, on ? (1 << RELAY_EXIO_BIT) : 0x00);
@@ -125,21 +124,8 @@ void relayInit() {
   relaySet(false); // start with the relay off
 }
 
-bool tca9554ReadBit(uint8_t bit) {
-  Wire.beginTransmission(TCA9554_ADDR);
-  Wire.write((uint8_t)TCA9554_REG_INPUT);
-  if (Wire.endTransmission(false) != 0) {
-    return false;
-  }
-  if (Wire.requestFrom((int)TCA9554_ADDR, 1) < 1) {
-    return false;
-  }
-  uint8_t val = Wire.read();
-  return (val >> bit) & 0x01;
-}
-
 // ===================== Persistent state (EEPROM) =====================
-#define CURRENT_EEPROM_VERSION 103 // bumped once to clear a stale freeze-protect=on left by an earlier bug
+#define CURRENT_EEPROM_VERSION 105 // bumped to force freeze-protect off now that its toggle comes from an MPR121 touch pad instead of the removed TCA9554 switch
 struct EepromData {
   uint8_t version;
   float preferredWaterLevel;
@@ -176,8 +162,6 @@ unsigned long fillingStartTime = millis();
 unsigned long fillingEndTime = millis();
 
 float previousSensorReadings[MAX_READING_SAMPLES];
-
-bool lastFreezeProtectPin = false;
 
 void startFilling() {
   relaySet(true);
@@ -248,14 +232,12 @@ void checkFilling() {
   }
 }
 
-void checkFreezeProtectPressed() {
-  bool pressed = tca9554ReadBit(FREEZE_PROTECT_EXIO_BIT);
-  if (pressed && !lastFreezeProtectPin) {
-    eData.inFreezeProtect = !eData.inFreezeProtect;
-    saveEeprom();
-    Serial.printf("Freeze protect %s\n", eData.inFreezeProtect ? "On" : "Off");
-  }
-  lastFreezeProtectPin = pressed;
+// Toggled by touching the freeze-protect pad (see FREEZE_PROTECT_PAD), the
+// same way the up/down water-level pads toggle their own state.
+void toggleFreezeProtect() {
+  eData.inFreezeProtect = !eData.inFreezeProtect;
+  saveEeprom();
+  Serial.printf("Freeze protect %s\n", eData.inFreezeProtect ? "On" : "Off");
 }
 
 void adjustDesiredWaterLevel(float delta) {
@@ -290,9 +272,9 @@ void checkAutoRestart() {
   }
 }
 
-// ===================== MPR121 capacitive touch (pins repurposed as desired-water-level +/-) =====================
+// ===================== MPR121 capacitive touch (HW-017 board: pads repurposed as desired-water-level +/- and freeze-protect toggle) =====================
 static const uint32_t POLL_MS = 20;
-static const uint32_t SCREEN_TIMEOUT_MS = 90000; // turn backlight off after this long with no touches
+static const uint32_t SCREEN_TIMEOUT_MS = 120000; // turn backlight off after this long with no touches
 
 // This chip's onboard baseline register stays stuck at 0, so cap.touched()'s
 // internal (baseline - filtered) comparison never trips even though filteredData()
@@ -304,8 +286,9 @@ static const uint8_t DEBOUNCE_SAMPLES = 4; // consecutive polls required before 
 
 // Only these MPR121 electrodes are wired up right now; add more pad numbers
 // here as additional pins get connected (up to 4 planned).
-static const uint8_t ACTIVE_PADS[] = {0, 1};
+static const uint8_t ACTIVE_PADS[] = {0, 1, 2};
 static const uint8_t NUM_ACTIVE_PADS = sizeof(ACTIVE_PADS) / sizeof(ACTIVE_PADS[0]);
+static const uint8_t FREEZE_PROTECT_PAD = 2; // touching this pad toggles freeze protect on/off
 
 // Pin 0 increases the desired water level, pin 1 decreases it (0.1in per touch)
 float padLevelDelta[12] = {0};
@@ -650,7 +633,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, 14 /* RST */, 1 /*rotation*/, 1 /*IPS
 #define WIFI_ICON_X PANEL_X
 #define WIFI_TEXT_X (WIFI_ICON_X + 17)
 #define WIFI_TEXT_CHARS 3
-#define BATTERY_ICON_X (WIFI_TEXT_X + WIFI_TEXT_CHARS * 12 + 14)
+#define BATTERY_ICON_X (WIFI_TEXT_X + WIFI_TEXT_CHARS * 12 + 28)
 
 uint16_t batteryColor(float percentage) {
   if (percentage > 50) return RGB565_GREEN;
@@ -697,7 +680,7 @@ void drawDashboardChrome() {
 
   gfx->drawRect(TANK_X, TANK_Y, TANK_W, TANK_H, RGB565_WHITE);
 
-  int yDesired = ROW_Y(5);
+  int yDesired = ROW_Y(2);
   gfx->fillTriangle(PANEL_X, yDesired + 4, PANEL_X, yDesired + 14, PANEL_X + 8, yDesired + 9, RGB565_YELLOW);
 
   int yBatt = ROW_Y(0);
@@ -730,7 +713,7 @@ void drawBatteryRow(int y) {
 
   char buf[16];
   snprintf(buf, sizeof(buf), "%.2fV", sensorVoltage);
-  printPadded(textX, y + 2, color, RGB565_BLACK, 8, buf);
+  printPadded(textX, y + 2, RGB565_WHITE, RGB565_BLACK, 8, buf);
 }
 
 void drawWaterRow(int y) {
@@ -829,8 +812,7 @@ void drawWifiIcon(int y) {
     gfx->drawLine(x + 1, top, x + 12, top + 10, RGB565_RED); // thicken the slash to 2px
   }
 
-  printPadded(WIFI_TEXT_X, y + 2, wifiConnected ? RGB565_GREEN : RGB565_GRAY, RGB565_BLACK,
-              WIFI_TEXT_CHARS, wifiConnected ? "Yes" : "No");
+  printPadded(WIFI_TEXT_X, y + 2, RGB565_WHITE, RGB565_BLACK, WIFI_TEXT_CHARS, wifiConnected ? "Yes" : "No");
 }
 
 void drawTankGauge() {
@@ -898,10 +880,10 @@ void updateStatsDisplay() {
   drawWifiIcon(ROW_Y(0));
   drawBatteryRow(ROW_Y(0));
   drawWaterRow(ROW_Y(1));
-  drawHeardRow(ROW_Y(2));
-  drawFillingPausedRow(ROW_Y(3));
-  drawFreezeRow(ROW_Y(4));
-  drawDesiredRow(ROW_Y(5));
+  drawDesiredRow(ROW_Y(2));
+  drawHeardRow(ROW_Y(3));
+  drawFillingPausedRow(ROW_Y(4));
+  drawFreezeRow(ROW_Y(5));
 }
 
 void setup() {
@@ -919,10 +901,6 @@ void setup() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
   relayInit();
-  // Prime the edge-detector with whatever the pin currently reads (floats
-  // HIGH via the TCA9554's internal pull-up until a real switch is wired),
-  // so we don't mistake "unwired" for "just pressed" on the first boot.
-  lastFreezeProtectPin = tca9554ReadBit(FREEZE_PROTECT_EXIO_BIT);
 
   // Switch the onboard CST816 touch controller into normal mode
   Wire.beginTransmission(CST816_ADDR);
@@ -987,8 +965,6 @@ void loop() {
   if (millis() - lastPollMs > POLL_MS) {
     lastPollMs = millis();
 
-    checkFreezeProtectPressed();
-
     if (screenTouchDetected()) {
       lastActivityMs = millis();
       if (!screenOn) {
@@ -1016,7 +992,11 @@ void loop() {
               screenOn = true;
             }
 
-            adjustDesiredWaterLevel(padLevelDelta[pad]);
+            if (pad == FREEZE_PROTECT_PAD) {
+              toggleFreezeProtect();
+            } else {
+              adjustDesiredWaterLevel(padLevelDelta[pad]);
+            }
             checkFilling();
             updateStatsDisplay();
           }
