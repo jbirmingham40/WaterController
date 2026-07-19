@@ -6,6 +6,7 @@
 #include <EEPROM.h>
 #include "Adafruit_MPR121.h"
 #include <Arduino_GFX_Library.h>
+#include "secrets.h" // WIFI_SSID / WIFI_PASSWORD - gitignored, copy secrets.h.example to fill in
 
 // ===================== WaterControllerV8 port: configurable settings =====================
 #define MAX_BATTERY_VOLTAGE 3.3f
@@ -26,8 +27,6 @@
 bool radioAckEnabled = false;
 
 // ===================== WiFi / NTP =====================
-static const char *WIFI_SSID = "***REMOVED***";
-static const char *WIFI_PASSWORD = "***REMOVED***";
 static const char *NTP_SERVER = "pool.ntp.org";
 // US Central time with automatic DST (CST6CDT, DST starts 2nd Sun in March, ends 1st Sun in November)
 static const char *TZ_INFO = "CST6CDT,M3.2.0,M11.1.0";
