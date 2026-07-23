@@ -6,7 +6,7 @@
 #include <EEPROM.h>
 #include "Adafruit_MPR121.h"
 #include <Arduino_GFX_Library.h>
-#include "secrets.h" // WIFI_SSID / WIFI_PASSWORD - gitignored, copy secrets.h.example to fill in
+#include "WebPortal.h"
 
 // ===================== WaterControllerV8 port: configurable settings =====================
 #define MAX_BATTERY_VOLTAGE 3.3f
@@ -26,63 +26,35 @@
 // controllers both acking the same sensor packet.
 bool radioAckEnabled = false;
 
-// ===================== WiFi / NTP =====================
-static const char *NTP_SERVER = "pool.ntp.org";
-// US Central time with automatic DST (CST6CDT, DST starts 2nd Sun in March, ends 1st Sun in November)
-static const char *TZ_INFO = "CST6CDT,M3.2.0,M11.1.0";
-static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
-
+// ===================== WiFi =====================
+// AP provisioning, STA connect/confirm, and NTP sync are all owned by
+// WebPortal (see WebPortal.h/.cpp) - it also runs the settings web server.
 bool wifiConnected = false;
 
-void connectWifiAndSyncTime() {
-  Serial.printf("Connecting to WiFi \"%s\"...\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  uint32_t startMs = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(250);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  wifiConnected = WiFi.status() == WL_CONNECTED;
-  if (!wifiConnected) {
-    Serial.println("WiFi connection failed, skipping NTP sync");
-    return;
-  }
-  Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
-
-  configTzTime(TZ_INFO, NTP_SERVER); // syncs over NTP, converts to local time per TZ_INFO
-
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 10000)) {
-    char buf[32];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
-    Serial.printf("Time synced: %s\n", buf);
-  } else {
-    Serial.println("Failed to obtain time from NTP server");
-  }
-}
-
-// ===================== Metrics (Graphite/Grafana, matches WaterControllerV8) =====================
-#define GRAFANA_HOSTNAME "grafana.jbirmingham.linkpc.net"
-#define METRICS_SERVER_PORT 2003
+// ===================== Metrics (Graphite/Carbon Cache line protocol, matches WaterControllerV8) =====================
+// Destination host/port are configurable from the settings web page and
+// persisted in NVS by WebPortal; CARBON_CACHE_*_DEFAULT (WebPortal.h) are
+// only the fallback values for a freshly-provisioned device.
 WiFiClient metricsClient;
-IPAddress grafanaIp;
-bool grafanaIpResolved = false;
 
 void sendMetric(const char *key, float value) {
   if (!wifiConnected) {
     return;
   }
-  if (!grafanaIpResolved) {
-    if (!WiFi.hostByName(GRAFANA_HOSTNAME, grafanaIp)) {
+  static String lastResolvedHost;
+  static IPAddress carbonCacheIp;
+  static bool carbonCacheIpResolved = false;
+
+  String host = WebPortal::getCarbonHost();
+  if (!carbonCacheIpResolved || host != lastResolvedHost) {
+    if (!WiFi.hostByName(host.c_str(), carbonCacheIp)) {
       return;
     }
-    grafanaIpResolved = true;
+    carbonCacheIpResolved = true;
+    lastResolvedHost = host;
   }
-  if (!metricsClient.connected() && !metricsClient.connect(grafanaIp, METRICS_SERVER_PORT)) {
+  uint16_t port = WebPortal::getCarbonPort();
+  if (!metricsClient.connected() && !metricsClient.connect(carbonCacheIp, port)) {
     return;
   }
   char line[128];
@@ -147,6 +119,11 @@ void loadEeprom() {
     saveEeprom();
   }
 }
+
+// Small accessors so WebPortal.cpp can read eData's fields for /api/status
+// without needing the EepromData struct definition duplicated there.
+float getPreferredWaterLevel() { return eData.preferredWaterLevel; }
+bool getFreezeProtectState() { return eData.inFreezeProtect; }
 
 // ===================== Sensor/filling state (matches WaterControllerV8) =====================
 float sensorVoltage = -1.0f;
@@ -284,10 +261,17 @@ static const int16_t RELEASE_DELTA = 3;  // drop below BASELINE to call it relea
 static const uint8_t DEBOUNCE_SAMPLES = 4; // consecutive polls required before latching
 
 // Only these MPR121 electrodes are wired up right now; add more pad numbers
-// here as additional pins get connected (up to 4 planned).
-static const uint8_t ACTIVE_PADS[] = {0, 1, 2};
+// here as additional pins get connected.
+static const uint8_t ACTIVE_PADS[] = {0, 1, 2, 3};
 static const uint8_t NUM_ACTIVE_PADS = sizeof(ACTIVE_PADS) / sizeof(ACTIVE_PADS[0]);
 static const uint8_t FREEZE_PROTECT_PAD = 2; // touching this pad toggles freeze protect on/off
+static const uint8_t WIFI_RESET_PAD = 3;     // double-press within the window below resets WiFi
+static const uint32_t WIFI_RESET_CONFIRM_WINDOW_MS = 5000;
+
+// 0 = no reset pending. Set to millis()+WIFI_RESET_CONFIRM_WINDOW_MS on the
+// first press of WIFI_RESET_PAD; a second press before this expires confirms
+// the reset. Cleared back to 0 (no action taken) once the window elapses.
+uint32_t wifiResetPendingUntilMs = 0;
 
 // Pin 0 increases the desired water level, pin 1 decreases it (0.1in per touch)
 float padLevelDelta[12] = {0};
@@ -768,6 +752,31 @@ void drawFreezeRow(int y) {
             eData.inFreezeProtect ? RGB565_BLACK : RGB565_LIGHTGREY);
 }
 
+// First press of WIFI_RESET_PAD shows this banner in the otherwise-unused
+// strip below the stat rows; a second press before it clears confirms the
+// reset. Only redraws on a shown/hidden transition (not every second) since
+// nothing else ever draws in this footprint.
+void drawWifiResetBanner() {
+  static bool lastShown = false;
+  bool shown = wifiResetPendingUntilMs != 0 && millis() < wifiResetPendingUntilMs;
+  if (shown == lastShown) {
+    return;
+  }
+  lastShown = shown;
+
+  int bannerY = ROW_Y(6);
+  int bannerH = gfx->height() - bannerY;
+  if (!shown) {
+    gfx->fillRect(0, bannerY, gfx->width(), bannerH, RGB565_BLACK);
+    return;
+  }
+  gfx->fillRect(0, bannerY, gfx->width(), bannerH, RGB565_RED);
+  gfx->setTextSize(2);
+  gfx->setTextColor(RGB565_WHITE, RGB565_RED);
+  gfx->setCursor(6, bannerY + (bannerH - 16) / 2);
+  gfx->print("Press again: reset WiFi");
+}
+
 void drawHeardRow(int y) {
   // Ticks every second once a reading exists, so there's no value to gate on
   // here - opaque printPadded() is what keeps this flicker-free, not skipping.
@@ -883,6 +892,7 @@ void updateStatsDisplay() {
   drawHeardRow(ROW_Y(3));
   drawFillingPausedRow(ROW_Y(4));
   drawFreezeRow(ROW_Y(5));
+  drawWifiResetBanner();
 }
 
 void setup() {
@@ -925,7 +935,7 @@ void setup() {
 
   rfmReady = rfmInit();
 
-  connectWifiAndSyncTime();
+  WebPortal::begin();
 
   checkFilling();
 
@@ -940,6 +950,8 @@ void loop() {
   static uint16_t lastFiltered[12];
 
   rfmPollReceive();
+
+  WebPortal::poll();
 
   checkAutoRestart();
 
@@ -963,6 +975,11 @@ void loop() {
 
   if (millis() - lastPollMs > POLL_MS) {
     lastPollMs = millis();
+
+    if (wifiResetPendingUntilMs != 0 && millis() >= wifiResetPendingUntilMs) {
+      wifiResetPendingUntilMs = 0; // confirm window elapsed with no second press - clear the banner
+      updateStatsDisplay();
+    }
 
     if (screenTouchDetected()) {
       lastActivityMs = millis();
@@ -993,6 +1010,11 @@ void loop() {
 
             if (pad == FREEZE_PROTECT_PAD) {
               toggleFreezeProtect();
+            } else if (pad == WIFI_RESET_PAD) {
+              if (wifiResetPendingUntilMs != 0 && millis() < wifiResetPendingUntilMs) {
+                WebPortal::resetWifiAndReboot(); // confirming second press - does not return
+              }
+              wifiResetPendingUntilMs = millis() + WIFI_RESET_CONFIRM_WINDOW_MS;
             } else {
               adjustDesiredWaterLevel(padLevelDelta[pad]);
             }
