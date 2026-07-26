@@ -68,6 +68,15 @@ static const uint32_t WIFI_TEST_RESULT_DISPLAY_MS = 8000;
 
 static bool lastWifiConnectedState = false;
 
+// ===================== STA reconnect =====================
+// The ESP32 doesn't always recover from every disconnect on its own (e.g. an
+// AP-side CCMP replay rejection can drop the driver to a bare "INIT" state
+// that a soft WiFi.reconnect() won't reliably clear) - so once WiFi has been
+// confirmed working, periodically re-issue a full WiFi.begin() while
+// disconnected, rather than only reacting to the initial connect.
+static uint32_t lastReconnectAttemptMs = 0;
+static const uint32_t RECONNECT_INTERVAL_MS = 30000;
+
 // ===================== Pending reboot =====================
 static bool rebootPending = false;
 static uint32_t rebootRequestedMs = 0;
@@ -137,6 +146,15 @@ static String renderPage(const char *pageProgmem) {
 
 // ===================== WiFi state machine =====================
 
+// Connects to previously-confirmed STA credentials, enables the core's own
+// auto-reconnect as a first line of defense, and marks the retry clock so
+// serviceStaReconnect() doesn't immediately pile on another attempt.
+static void beginStaConnect(const String &ssid, const String &pass) {
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  lastReconnectAttemptMs = millis();
+}
+
 static void beginWifiTest(const String &ssid, const String &pass) {
   pendingTestSsid = ssid;
   pendingTestPass = pass;
@@ -161,7 +179,7 @@ static void serviceWifiTestStateMachine() {
     } else if (millis() - wifiTestStartMs > WIFI_TEST_TIMEOUT_MS) {
       WiFi.disconnect();
       if (savedStaSsid.length() > 0) {
-        WiFi.begin(savedStaSsid.c_str(), savedStaPass.c_str()); // restore the previously-working connection
+        beginStaConnect(savedStaSsid, savedStaPass); // restore the previously-working connection
       }
       wifiTestState = WIFI_TEST_FAILED;
       wifiTestResultStartMs = millis();
@@ -192,6 +210,23 @@ static void serviceWifiConnectedEdge() {
   } else {
     Serial.println("WiFi disconnected");
   }
+}
+
+// Only relevant once WiFi has been confirmed and we're not mid-test - the
+// AP-only (unconfigured) and WiFi-test states manage the radio themselves.
+static void serviceStaReconnect() {
+  if (!apConfirmed || wifiTestState != WIFI_TEST_IDLE) {
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+  if (millis() - lastReconnectAttemptMs < RECONNECT_INTERVAL_MS) {
+    return;
+  }
+  Serial.println("WiFi still disconnected - retrying...");
+  WiFi.disconnect();
+  beginStaConnect(savedStaSsid, savedStaPass);
 }
 
 static const char *wifiTestStateName() {
@@ -366,7 +401,7 @@ void begin() {
 
   if (apConfirmed && savedStaSsid.length() > 0) {
     WiFi.mode(WIFI_STA);
-    WiFi.begin(savedStaSsid.c_str(), savedStaPass.c_str());
+    beginStaConnect(savedStaSsid, savedStaPass);
     Serial.printf("Connecting to WiFi \"%s\"...\n", savedStaSsid.c_str());
   } else {
     WiFi.mode(WIFI_AP);
@@ -380,6 +415,7 @@ void begin() {
 void poll() {
   serviceWifiTestStateMachine();
   serviceWifiConnectedEdge();
+  serviceStaReconnect();
   if (rebootPending && millis() - rebootRequestedMs > REBOOT_DELAY_MS) {
     ESP.restart();
   }
