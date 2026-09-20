@@ -107,6 +107,12 @@ static const char SETTINGS_PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 </form>
 </div>
 
+<h2>Touch Pads</h2>
+<div class="card">
+<div id="touch-rows"></div>
+<div class="msg" id="touch-note"></div>
+</div>
+
 <h2>Device</h2>
 <div class="card">
 <button class="danger" id="reboot-btn">Reboot</button>
@@ -127,6 +133,36 @@ function fmtSecs(s){
   if (s < 3600) return Math.floor(s/60) + 'm ago';
   return Math.floor(s/3600) + 'h ago';
 }
+var PAD_NAMES = {0:'Level +', 1:'Level -', 2:'Freeze protect', 3:'WiFi reset'};
+// Shows each pad's live margin (baseline - filtered) against the touch
+// threshold. A pad sitting well under the threshold while untouched is the
+// early warning that it is drifting toward unresponsive.
+function renderTouch(j){
+  var el = document.getElementById('touch-rows');
+  if (!el || !j.touchPads) return;
+  var html = '', weak = 0;
+  j.touchPads.forEach(function(p){
+    var name = PAD_NAMES[p.pad] || ('Pad ' + p.pad);
+    var badge, cls;
+    if (!p.ready) { badge = 'calibrating'; cls = 'off'; }
+    else if (p.touched) { badge = 'touched'; cls = 'ok'; }
+    else { badge = 'idle'; cls = 'ok'; }
+    // Idle margin should hover near 0; a large standing offset means the
+    // baseline is chasing something and headroom for a real press is gone.
+    if (p.ready && !p.touched && Math.abs(p.delta) > j.touchDelta / 2) {
+      cls = 'warn'; badge = 'drifting'; weak++;
+    }
+    html += '<div class="row"><span>' + name + '</span><span class="v">' +
+            '<span class="badge ' + cls + '">' + badge + '</span> ' +
+            p.filtered + '/' + p.baseline + ' (' + (p.delta >= 0 ? '+' : '') + p.delta + ')' +
+            '</span></div>';
+  });
+  el.innerHTML = html;
+  var note = 'threshold ' + j.touchDelta + ' &middot; filtered/baseline (margin)';
+  if (weak) note += ' &middot; ' + weak + ' pad(s) drifting';
+  if (j.touchI2cRecoveries) note += ' &middot; I2C recoveries: ' + j.touchI2cRecoveries;
+  document.getElementById('touch-note').innerHTML = note;
+}
 var wifiFormDirty = false, carbonFormDirty = false;
 function refresh(){
   fetch('/api/status').then(function(r){
@@ -142,6 +178,8 @@ function refresh(){
     document.getElementById('s-heard').textContent = fmtSecs(j.lastHeardSecsAgo);
     document.getElementById('lvl-val').textContent = j.preferredWaterLevel.toFixed(1) + '"';
     document.getElementById('freeze-val').textContent = j.inFreezeProtect ? 'ON' : 'OFF';
+
+    renderTouch(j);
 
     var ips = [];
     if (j.staIp) ips.push('<code>' + j.staIp + '</code>');

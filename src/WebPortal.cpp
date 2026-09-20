@@ -25,6 +25,11 @@ extern void toggleFreezeProtect();
 extern void checkFilling();
 extern float getPreferredWaterLevel();
 extern bool getFreezeProtectState();
+// Capacitive-pad diagnostics, so pad sensitivity drift and I2C bus recovery
+// are observable from the settings page rather than only via a serial cable.
+extern size_t formatTouchDiagnostics(char *out, size_t outLen);
+extern uint32_t getTouchI2cRecoveryCount();
+extern int16_t getTouchTouchDelta();
 
 namespace WebPortal {
 
@@ -300,19 +305,25 @@ static void handleStatus(AsyncWebServerRequest *request) {
   String apIp = apActive ? WiFi.softAPIP().toString() : "";
   long lastHeardSecsAgo = completedFirstSensorReading ? (long)((millis() - lastHeardFromSensorTime) / 1000) : -1;
 
-  char body[576];
+  // ~86 chars per pad at worst (4-digit readings, signed delta) plus brackets.
+  char touchPads[448];
+  formatTouchDiagnostics(touchPads, sizeof(touchPads));
+
+  char body[1280];
   snprintf(body, sizeof(body),
            "{\"wifiConnected\":%s,\"apActive\":%s,\"staSsid\":\"%s\",\"staIp\":\"%s\","
            "\"apIp\":\"%s\","
            "\"wifiTest\":\"%s\",\"sensorWaterLevel\":%.2f,\"sensorVoltage\":%.2f,"
            "\"sensorPercentage\":%.1f,\"preferredWaterLevel\":%.1f,\"inFreezeProtect\":%s,"
            "\"isFilling\":%s,\"fillingPaused\":%s,\"lastHeardSecsAgo\":%ld,"
-           "\"carbonHost\":\"%s\",\"carbonPort\":%u,\"uptimeMs\":%lu}",
+           "\"carbonHost\":\"%s\",\"carbonPort\":%u,\"uptimeMs\":%lu,"
+           "\"touchPads\":%s,\"touchDelta\":%d,\"touchI2cRecoveries\":%lu}",
            wifiConnected ? "true" : "false", apActive ? "true" : "false", jsonEscape(staSsid).c_str(),
            staIp.c_str(), apIp.c_str(), wifiTestStateName(), sensorWaterLevel, sensorVoltage, sensorPercentage,
            getPreferredWaterLevel(), getFreezeProtectState() ? "true" : "false", isFilling ? "true" : "false",
            fillingPaused ? "true" : "false", lastHeardSecsAgo, jsonEscape(carbonHost).c_str(), carbonPort,
-           (unsigned long)millis());
+           (unsigned long)millis(), touchPads, (int)getTouchTouchDelta(),
+           (unsigned long)getTouchI2cRecoveryCount());
   request->send(200, "application/json", body);
 }
 
