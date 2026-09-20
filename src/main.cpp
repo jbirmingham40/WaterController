@@ -55,6 +55,7 @@ void sendMetric(const char *key, float value) {
   }
   uint16_t port = WebPortal::getCarbonPort();
   if (!metricsClient.connected() && !metricsClient.connect(carbonCacheIp, port)) {
+    Serial.println("Failed to connect to metrics server");
     return;
   }
   char line[128];
@@ -752,6 +753,44 @@ void drawFreezeRow(int y) {
             eData.inFreezeProtect ? RGB565_BLACK : RGB565_LIGHTGREY);
 }
 
+// The device's own address, in the strip below the stat rows - this is how you
+// find the settings portal without a serial console. Shares its footprint with
+// the WiFi-reset banner (which takes precedence while pending), so both track
+// footerNeedsRedraw to know when the other has clobbered them.
+bool footerNeedsRedraw = true;
+
+void drawIpFooter() {
+  static char lastText[24] = "";
+
+  // The banner owns this strip while it's pending; drawing under it would just
+  // be overpainted every second.
+  if (wifiResetPendingUntilMs != 0 && millis() < wifiResetPendingUntilMs) {
+    return;
+  }
+
+  char text[24];
+  if (wifiConnected) {
+    snprintf(text, sizeof(text), "%s", WiFi.localIP().toString().c_str());
+  } else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+    snprintf(text, sizeof(text), "AP %s", WiFi.softAPIP().toString().c_str());
+  } else {
+    snprintf(text, sizeof(text), "no network");
+  }
+
+  if (!footerNeedsRedraw && strcmp(text, lastText) == 0) {
+    return; // same address, and nothing has painted over us
+  }
+  strncpy(lastText, text, sizeof(lastText) - 1);
+  lastText[sizeof(lastText) - 1] = '\0';
+  footerNeedsRedraw = false;
+
+  // 15 chars covers the widest case: "AP 192.168.4.1".
+  const int chars = 15;
+  int footerY = ROW_Y(6);
+  int footerH = gfx->height() - footerY;
+  printPadded(4, footerY + (footerH - 16) / 2, RGB565_GRAY, RGB565_BLACK, chars, text);
+}
+
 // First press of WIFI_RESET_PAD shows this banner in the otherwise-unused
 // strip below the stat rows; a second press before it clears confirms the
 // reset. Only redraws on a shown/hidden transition (not every second) since
@@ -768,6 +807,7 @@ void drawWifiResetBanner() {
   int bannerH = gfx->height() - bannerY;
   if (!shown) {
     gfx->fillRect(0, bannerY, gfx->width(), bannerH, RGB565_BLACK);
+    footerNeedsRedraw = true; // we just erased the IP footer - let it repaint
     return;
   }
   gfx->fillRect(0, bannerY, gfx->width(), bannerH, RGB565_RED);
@@ -892,12 +932,14 @@ void updateStatsDisplay() {
   drawHeardRow(ROW_Y(3));
   drawFillingPausedRow(ROW_Y(4));
   drawFreezeRow(ROW_Y(5));
+  drawIpFooter();
   drawWifiResetBanner();
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(200); // let native USB-CDC enumerate before first prints
+  delay(10000);
+  Serial.println("Setting up WaterController...");
 
   loadEeprom();
   for (int i = 0; i < MAX_READING_SAMPLES; i++) {
@@ -919,9 +961,6 @@ void setup() {
 
   if (!cap.begin(0x5A)) {
     Serial.println("MPR121 not found on I2C bus (addr 0x5A) — check ADD pin wiring");
-    while (1) {
-      delay(1000);
-    }
   }
 
   if (!gfx->begin()) {
@@ -943,6 +982,13 @@ void setup() {
 }
 
 void loop() {
+
+  static uint32_t lastLoopPrintMs = 0;
+  if (millis() - lastLoopPrintMs >= 1000UL) {
+    lastLoopPrintMs = millis();
+    Serial.println("WaterController loop tick");
+  }
+
   static uint32_t lastPollMs = 0;
   static uint32_t lastMetricUpdateMs = 0;
   static uint32_t lastCheckFillingMs = 0;

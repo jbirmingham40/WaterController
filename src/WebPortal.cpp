@@ -297,17 +297,19 @@ static void handleStatus(AsyncWebServerRequest *request) {
   bool apActive = WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA;
   String staSsid = wifiConnected ? WiFi.SSID() : savedStaSsid;
   String staIp = wifiConnected ? WiFi.localIP().toString() : "";
+  String apIp = apActive ? WiFi.softAPIP().toString() : "";
   long lastHeardSecsAgo = completedFirstSensorReading ? (long)((millis() - lastHeardFromSensorTime) / 1000) : -1;
 
-  char body[512];
+  char body[576];
   snprintf(body, sizeof(body),
            "{\"wifiConnected\":%s,\"apActive\":%s,\"staSsid\":\"%s\",\"staIp\":\"%s\","
+           "\"apIp\":\"%s\","
            "\"wifiTest\":\"%s\",\"sensorWaterLevel\":%.2f,\"sensorVoltage\":%.2f,"
            "\"sensorPercentage\":%.1f,\"preferredWaterLevel\":%.1f,\"inFreezeProtect\":%s,"
            "\"isFilling\":%s,\"fillingPaused\":%s,\"lastHeardSecsAgo\":%ld,"
            "\"carbonHost\":\"%s\",\"carbonPort\":%u,\"uptimeMs\":%lu}",
            wifiConnected ? "true" : "false", apActive ? "true" : "false", jsonEscape(staSsid).c_str(),
-           staIp.c_str(), wifiTestStateName(), sensorWaterLevel, sensorVoltage, sensorPercentage,
+           staIp.c_str(), apIp.c_str(), wifiTestStateName(), sensorWaterLevel, sensorVoltage, sensorPercentage,
            getPreferredWaterLevel(), getFreezeProtectState() ? "true" : "false", isFilling ? "true" : "false",
            fillingPaused ? "true" : "false", lastHeardSecsAgo, jsonEscape(carbonHost).c_str(), carbonPort,
            (unsigned long)millis());

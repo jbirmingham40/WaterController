@@ -6,7 +6,7 @@
 // that sendMetric() (main.cpp) sends to. The actual host/port are
 // configurable from the settings web page and persisted in NVS - these are
 // only what a freshly-provisioned device starts with.
-#define CARBON_CACHE_HOSTNAME_DEFAULT "grafana.jbirmingham.linkpc.net"
+#define CARBON_CACHE_HOSTNAME_DEFAULT "grafana.thegeeknerd.com"
 #define CARBON_CACHE_PORT_DEFAULT 2003
 
 // Owns the device's WiFi AP/STA provisioning state machine and the settings

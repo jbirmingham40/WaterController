@@ -28,6 +28,8 @@ button:disabled{opacity:.5;cursor:default;}
 .levelctl{display:flex;align-items:center;gap:12px;}
 .levelctl .val{font-size:1.4em;font-weight:600;min-width:70px;text-align:center;}
 a.logout{color:#9fb0bd;font-size:.85em;text-decoration:none;float:right;}
+footer{max-width:480px;margin:20px auto 8px;color:#7d8f9c;font-size:.8em;text-align:center;}
+footer code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#9fb0bd;}
 )CSS";
 
 static const char LOGIN_PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
@@ -111,6 +113,7 @@ static const char SETTINGS_PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 </div>
 
 </div>
+<footer id="foot">&nbsp;</footer>
 <script>
 function post(url, data){
   return fetch(url, {method:'POST', body:new URLSearchParams(data||{})}).then(function(r){
@@ -131,7 +134,7 @@ function refresh(){
     return r.json();
   }).then(function(j){
     if (!j) return;
-    document.getElementById('s-wifi').textContent = j.wifiConnected ? (j.staSsid + ' (' + j.staIp + ')') : 'disconnected';
+    document.getElementById('s-wifi').textContent = j.wifiConnected ? j.staSsid : 'disconnected';
     document.getElementById('s-ap').textContent = j.apActive ? 'broadcasting' : 'off';
     document.getElementById('s-level').textContent = j.sensorWaterLevel >= 0 ? j.sensorWaterLevel.toFixed(1) + '" (' + j.sensorPercentage.toFixed(0) + '%)' : 'unknown';
     document.getElementById('s-batt').textContent = j.sensorVoltage >= 0 ? j.sensorVoltage.toFixed(2) + 'V' : 'unknown';
@@ -139,6 +142,11 @@ function refresh(){
     document.getElementById('s-heard').textContent = fmtSecs(j.lastHeardSecsAgo);
     document.getElementById('lvl-val').textContent = j.preferredWaterLevel.toFixed(1) + '"';
     document.getElementById('freeze-val').textContent = j.inFreezeProtect ? 'ON' : 'OFF';
+
+    var ips = [];
+    if (j.staIp) ips.push('<code>' + j.staIp + '</code>');
+    if (j.apIp) ips.push('AP <code>' + j.apIp + '</code>');
+    document.getElementById('foot').innerHTML = ips.length ? ips.join(' &middot; ') : '&nbsp;';
 
     if (!wifiFormDirty) document.getElementById('wifi-ssid').value = j.staSsid || '';
     if (!carbonFormDirty) {
