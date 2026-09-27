@@ -305,11 +305,12 @@ static void handleStatus(AsyncWebServerRequest *request) {
   String apIp = apActive ? WiFi.softAPIP().toString() : "";
   long lastHeardSecsAgo = completedFirstSensorReading ? (long)((millis() - lastHeardFromSensorTime) / 1000) : -1;
 
-  // ~86 chars per pad at worst (4-digit readings, signed delta) plus brackets.
-  char touchPads[448];
+  // ~86 chars per pad at worst (4-digit readings, signed delta) plus
+  // brackets, and up to ~95 more per pad for the PHANTOM_TRACE counters.
+  char touchPads[832];
   formatTouchDiagnostics(touchPads, sizeof(touchPads));
 
-  char body[1280];
+  char body[1664];
   snprintf(body, sizeof(body),
            "{\"wifiConnected\":%s,\"apActive\":%s,\"staSsid\":\"%s\",\"staIp\":\"%s\","
            "\"apIp\":\"%s\","

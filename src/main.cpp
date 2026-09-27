@@ -4,6 +4,7 @@
 #include <WiFiClient.h>
 #include <time.h>
 #include <EEPROM.h>
+#include <esp_task_wdt.h>
 #include "Adafruit_MPR121.h"
 #include <Arduino_GFX_Library.h>
 #include "WebPortal.h"
@@ -315,7 +316,7 @@ void checkAutoRestart() {
 
 // ===================== MPR121 capacitive touch (HW-017 board: pads repurposed as desired-water-level +/- and freeze-protect toggle) =====================
 static const uint32_t POLL_MS = 20;
-static const uint32_t SCREEN_TIMEOUT_MS = 120000; // turn backlight off after this long with no touches
+static const uint32_t SCREEN_TIMEOUT_MS = 60000;  // turn backlight off after this long with no touches
 
 // Touch detection compares filteredData() against a per-pad baseline that is
 // tracked in software (see touchTask), so environmental drift can't walk the
@@ -345,7 +346,14 @@ static const uint32_t SCREEN_TIMEOUT_MS = 120000; // turn backlight off after th
 // measured sensitivity is the same with the radio disabled.
 static const int16_t TOUCH_DELTA = 4;   // excursion from baseline to call it touched
 static const int16_t RELEASE_DELTA = 2; // excursion below this to call it released
-static const uint8_t DEBOUNCE_SAMPLES = 2; // consecutive in-window polls before latching
+// Raised from 2 to 3 (2026-09-24) against phantom presses. With the pads
+// swapped for jumpers, idle peaks still reached 5-7 counts - over TOUCH_DELTA
+// - and p0 latched twice in 60s untouched. TOUCH_DELTA can't absorb that (5
+// misses real presses, above), so a press must instead persist for 60ms.
+// An earlier try at 3 was reverted for "tons of invalid readings", but the
+// trace showed those were the original pads reading 10-33 counts idle, which
+// no debounce setting would have stopped.
+static const uint8_t DEBOUNCE_SAMPLES = 3; // consecutive in-window polls before latching
 
 // Movement that marks a pad as "possibly being pressed". Above this the
 // baseline stops adapting, so a developing press is not chased by its own
@@ -417,11 +425,6 @@ uint16_t armedFor[12] = {0};
 // millis() when a pad latched, 0 when not held. Backstop against a pad
 // latching forever if its baseline was stale when the press landed.
 uint32_t heldSince[12] = {0};
-#ifdef SENS_TRACE
-// Peak deflection per pad within the current reporting window.
-int16_t sensPeak[12] = {0};
-uint32_t sensLatches[12] = {0};
-#endif
 
 bool screenOn = true;
 uint32_t lastActivityMs = 0;
@@ -441,6 +444,15 @@ static QueueHandle_t touchEventQueue = nullptr;
 static TaskHandle_t touchTaskHandle = nullptr;
 static const uint32_t TOUCH_TASK_STACK = 3072;
 static const UBaseType_t TOUCH_TASK_PRIORITY = 2; // above loopTask (priority 1)
+
+// Task watchdog: restarts the device if loop() or the touch task stops
+// running. A precaution against hangs, so it is set far longer than any
+// legitimate stall - the slowest calls in the loop are a DNS lookup (a few
+// seconds) and the radio's bounded waits (~150ms) - but short enough that a
+// hung device comes back within a minute. The hardware allows ~24 days, but
+// that would outlast the scheduled 24h restart, which a hung loop can't reach
+// anyway.
+static const uint32_t WATCHDOG_TIMEOUT_MS = 60000;
 
 // Most recent filtered reading per pad, and the tracked baseline it is being
 // compared against. Both are surfaced on /api/status so the pads' margin can
@@ -470,6 +482,21 @@ static const uint8_t TOUCH_EVENT_SCREEN = 0xFF;
 // deflection fell to 5-12 counts, so presses stopped registering. With
 // autoconfig off the pads return to their original small-signal operating
 // point, where the touch/release deltas below are sized to work.
+//
+// On top of that, the chip's noise filters are raised from the library's
+// minimums (2026-09-25). Phantom presses were far more frequent on the
+// PR4A061 USB-C buck fed by an ALT-2401 adapter than on laptop USB -
+// consistent with mains-frequency common-mode leakage from the adapter,
+// which the pad wires pick up. Only the averaging fields change; the charge
+// current (16uA) and charge time (0.5us) are left as the library sets them,
+// so the idle operating point the thresholds were tuned against is kept.
+//   CONFIG1 0x10 -> 0x90: first filter 6 -> 18 samples per measurement
+//   CONFIG2 0x20 -> 0x39: second filter 4 -> 18 samples, 1ms -> 2ms apart,
+//     i.e. a ~36ms averaging window, about two 60Hz mains cycles
+// The cost is response time: a press takes ~36ms longer to show fully in
+// filteredData().
+static const uint8_t MPR121_CONFIG1_VALUE = 0x90; // FFI=18, CDC=16uA
+static const uint8_t MPR121_CONFIG2_VALUE = 0x39; // CDT=0.5us, SFI=18, ESI=2ms
 // Callers must not hold the I2C lock.
 bool mpr121Init() {
   i2cLock();
@@ -478,120 +505,6 @@ bool mpr121Init() {
   return ok;
 }
 
-#ifdef MPR121_DIAGNOSTICS
-// Continuous MPR121 monitor across ALL 12 channels.
-//
-// Reading this output: a touch should pull an electrode's filtered value
-// DOWN by clearly more than the idle noise. On this board the pads run at a
-// small-signal point (idle ~15 with autoconfig off), so judge deflection
-// relative to the idle jitter, not against an absolute count.
-//
-// History worth knowing: enabling autoconfig on 2026-09-19 raised the idle
-// readings to ~710 but flattened touch deflection to 5-12 counts, and the
-// buttons largely stopped responding. Electrodes 0-3 are wired and working;
-// an earlier reading of this output wrongly concluded they were unconnected
-// because only a 10s window was sampled. All 12 channels are watched here
-// since ACTIVE_PADS assumes 0-3.
-//
-// AUTOCONFIG1 bit0 (ACFF) flags an autoconfig failure, in which case the
-// per-pad charge settings fell back to defaults.
-// Sized for the small-signal operating point (idle ~15, noise ~+/-1).
-// Raise this if the pads are ever run at a higher idle point.
-static const int16_t DIAG_NOTE_DELTA = 3; // report excursions beyond this
-
-void mpr121DumpRegisters() {
-  i2cLock();
-  uint8_t ecr = cap.readRegister8(MPR121_ECR);
-  uint8_t cfg1 = cap.readRegister8(MPR121_CONFIG1);
-  uint8_t cfg2 = cap.readRegister8(MPR121_CONFIG2);
-  uint8_t ac0 = cap.readRegister8(MPR121_AUTOCONFIG0);
-  uint8_t ac1 = cap.readRegister8(MPR121_AUTOCONFIG1);
-  uint16_t touchBits = cap.touched();
-  i2cUnlock();
-
-  Serial.println("--- MPR121 diagnostics (all 12 channels) ---");
-  Serial.printf("ECR=0x%02X (run=%s, electrodes=%u)  CONFIG1=0x%02X  CONFIG2=0x%02X\n",
-                ecr, (ecr & 0x3F) ? "yes" : "NO", ecr & 0x0F, cfg1, cfg2);
-  Serial.printf("AUTOCONFIG0=0x%02X AUTOCONFIG1=0x%02X%s\n", ac0, ac1,
-                (ac1 & 0x01) ? "  <-- ACFF: AUTOCONFIG FAILED" : "");
-  Serial.printf("touched() bitmap=0x%03X\n", touchBits);
-
-  Serial.print("idle filtered: ");
-  for (uint8_t ch = 0; ch < 12; ch++) {
-    i2cLock();
-    uint16_t f = cap.filteredData(ch);
-    uint16_t b = cap.baselineData(ch);
-    i2cUnlock();
-    Serial.printf("e%u:%u/%u ", ch, f, b);
-  }
-  Serial.println();
-}
-
-// Never returns. Runs the live monitor as the sole activity so nothing else
-// on the loop can interfere with or delay the sampling.
-void mpr121MonitorForever() {
-  uint16_t settled[12];
-  uint16_t lo[12], hi[12];
-  bool reported[12] = {false};
-
-  for (uint8_t ch = 0; ch < 12; ch++) {
-    i2cLock();
-    uint16_t f = cap.filteredData(ch);
-    i2cUnlock();
-    settled[ch] = f;
-    lo[ch] = f;
-    hi[ch] = f;
-  }
-
-  Serial.println("Monitoring all 12 electrodes. Touch each pad in turn;");
-  Serial.println("excursions are printed immediately, summary every 5s.");
-  Serial.println("Press the pads you expect to be Level+/Level-/Freeze/WiFi.");
-
-  uint32_t lastSummary = millis();
-  uint16_t prevTouch = 0;
-
-  for (;;) {
-    i2cLock();
-    uint16_t touchBits = cap.touched();
-    i2cUnlock();
-    if (touchBits != prevTouch) {
-      Serial.printf("[touched() changed: 0x%03X]\n", touchBits);
-      prevTouch = touchBits;
-    }
-
-    for (uint8_t ch = 0; ch < 12; ch++) {
-      i2cLock();
-      uint16_t f = cap.filteredData(ch);
-      i2cUnlock();
-      if (f == 0xFFFF) {
-        continue;
-      }
-      if (f < lo[ch]) lo[ch] = f;
-      if (f > hi[ch]) hi[ch] = f;
-
-      int16_t delta = (int16_t)settled[ch] - (int16_t)f;
-      if (delta > DIAG_NOTE_DELTA || delta < -DIAG_NOTE_DELTA) {
-        Serial.printf("  >>> e%u MOVED: %u -> %u (delta %+d)\n",
-                      ch, settled[ch], f, -delta);
-        reported[ch] = true;
-      }
-    }
-
-    if (millis() - lastSummary >= 5000) {
-      lastSummary = millis();
-      Serial.print("summary min/max/span: ");
-      for (uint8_t ch = 0; ch < 12; ch++) {
-        uint16_t span = hi[ch] - lo[ch];
-        Serial.printf("e%u:%u-%u(%u)%s ", ch, lo[ch], hi[ch], span,
-                      reported[ch] ? "*" : "");
-      }
-      Serial.println();
-    }
-
-    delay(50);
-  }
-}
-#endif // MPR121_DIAGNOSTICS
 
 // Drops and re-opens the shared I2C bus, then re-inits the MPR121. Called
 // from the touch task when reads have been failing long enough to look like
@@ -614,38 +527,17 @@ void i2cRecover() {
 // own touch_bsp.c: burst-read 7 bytes from reg 0x00; byte[2] is finger count.
 #define CST816_ADDR 0x15
 
-#ifdef TOUCH_TRACE
-// I2C bus health counters. The MPR121 pads and this CST816 touchscreen are
-// separate chips sharing only the I2C bus, so both degrading at once points
-// at the bus rather than at either chip's electrodes.
-volatile uint32_t cstPolls = 0, cstAddrFail = 0, cstShortRead = 0, cstFingers = 0;
-// MPR121 read timing. A bus that has gone slow (clock stretching, marginal
-// pull-ups, noise causing retries) throttles the sample rate the debouncer
-// depends on, which looks exactly like insensitive pads.
-volatile uint32_t mprReads = 0, mprReadUsTotal = 0, mprReadUsMax = 0;
-volatile uint32_t touchLoopIters = 0;
-#endif
-
 bool screenTouchDetected() {
   i2cLock();
-#ifdef TOUCH_TRACE
-  cstPolls++;
-#endif
   Wire.beginTransmission(CST816_ADDR);
   Wire.write((uint8_t)0x00);
   uint8_t txResult = Wire.endTransmission(false);
   if (txResult != 0) {
-#ifdef TOUCH_TRACE
-    cstAddrFail++;
-#endif
     i2cUnlock();
     return false;
   }
   uint8_t n = Wire.requestFrom((int)CST816_ADDR, 3);
   if (n < 3) {
-#ifdef TOUCH_TRACE
-    cstShortRead++;
-#endif
     i2cUnlock();
     return false;
   }
@@ -654,11 +546,6 @@ bool screenTouchDetected() {
     buf[i] = Wire.read();
   }
   i2cUnlock();
-#ifdef TOUCH_TRACE
-  if (buf[2] != 0) {
-    cstFingers++;
-  }
-#endif
   return buf[2] != 0;
 }
 
@@ -1307,7 +1194,11 @@ void touchTask(void *param) {
   // Previous CST816 finger state, for edge detection below.
   bool screenTouchPrev = false;
 
+  esp_task_wdt_add(nullptr); // this task must keep polling, or the device restarts
+
   for (;;) {
+    esp_task_wdt_reset();
+
     // Edge-triggered, not level-triggered. This used to queue an event on
     // every poll where a finger was present, so holding or tapping the
     // screen enqueued ~50 events/second. Each one makes the main loop run
@@ -1327,18 +1218,7 @@ void touchTask(void *param) {
       uint8_t pad = ACTIVE_PADS[i];
 
       i2cLock();
-#ifdef TOUCH_TRACE
-      uint32_t readStartUs = micros();
-#endif
       uint16_t filtered = cap.filteredData(pad);
-#ifdef TOUCH_TRACE
-      uint32_t readUs = micros() - readStartUs;
-      mprReadUsTotal += readUs;
-      mprReads++;
-      if (readUs > mprReadUsMax) {
-        mprReadUsMax = readUs;
-      }
-#endif
       i2cUnlock();
 
       // filteredData() returns 0xFFFF when the underlying I2C read fails
@@ -1390,32 +1270,6 @@ void touchTask(void *param) {
       int16_t signedDelta = (int16_t)baseline - (int16_t)filtered;
       int16_t delta = signedDelta < 0 ? (int16_t)-signedDelta : signedDelta;
 
-#ifdef TOUCH_TRACE
-      // Traces the values the detector actually computes, once per second per
-      // pad plus on every threshold crossing. Diagnosing this from a separate
-      // monitor loop proved misleading - this is the real code path.
-      {
-        // Report the peak excursion seen per pad each second, not just a
-        // point sample - a brief press between samples was otherwise
-        // invisible and made the pads look less sensitive than they are.
-        static uint32_t lastTrace[12] = {0};
-        static int16_t peakDelta[12] = {0};
-        static uint16_t peakFiltered[12] = {0};
-        if (delta > peakDelta[pad]) {
-          peakDelta[pad] = delta;
-          peakFiltered[pad] = filtered;
-        }
-        if (delta > TOUCH_DELTA || millis() - lastTrace[pad] >= 1000) {
-          lastTrace[pad] = millis();
-          Serial.printf("[t] pad%u f=%u base=%u |d|=%d PEAK|d|=%d(f=%u) cand=%u %s\n",
-                        pad, filtered, baseline, delta,
-                        peakDelta[pad], peakFiltered[pad],
-                        touchCandidate[pad],
-                        touchedState[pad] ? "HELD" : "");
-          peakDelta[pad] = 0;
-        }
-      }
-#endif
 
       if (!touchedState[pad]) {
         // Baseline tracking, with the rate chosen so a developing press is
@@ -1452,23 +1306,13 @@ void touchTask(void *param) {
           padBaseline[pad] += step;
         }
 
-#ifdef SENS_TRACE
-        // Track peak deflection per pad so a drop in sensitivity is visible
-        // against the boot clock, alongside whatever else is starting up.
-        if (delta > sensPeak[pad]) {
-          sensPeak[pad] = delta;
-        }
-#endif
-
         if (delta > TOUCH_DELTA) {
           if (++touchCandidate[pad] >= DEBOUNCE_SAMPLES) {
             touchedState[pad] = true;
             touchCandidate[pad] = 0;
             releaseCandidate[pad] = 0;
             heldSince[pad] = millis();
-#ifdef SENS_TRACE
-            sensLatches[pad]++;
-#endif
+
             // Judge the release against the last settled pre-touch value, so
             // a baseline that drifted during the press cannot leave the pad
             // stuck reporting touched.
@@ -1513,60 +1357,6 @@ void touchTask(void *param) {
       }
     }
 
-#ifdef TOUCH_TRACE
-    // Bus-health report. Both touch chips share only the I2C bus, so if the
-    // MPR121 pads and the CST816 screen are failing together, this is where
-    // the common cause shows up: slow reads, address NAKs or short reads.
-    touchLoopIters++;
-    {
-      static uint32_t lastBusReport = 0;
-      if (millis() - lastBusReport >= 5000) {
-        uint32_t elapsed = millis() - lastBusReport;
-        lastBusReport = millis();
-        uint32_t avgUs = mprReads ? (mprReadUsTotal / mprReads) : 0;
-        // Read the chip's mode back live. All four pads losing sensitivity
-        // together points at chip state, not at four separate electrodes -
-        // ECR leaving Run Mode, or the electrode count being reset, would do
-        // exactly that while every I2C read still succeeds.
-        i2cLock();
-        uint8_t ecrNow = cap.readRegister8(MPR121_ECR);
-        uint8_t cfg1Now = cap.readRegister8(MPR121_CONFIG1);
-        uint8_t cfg2Now = cap.readRegister8(MPR121_CONFIG2);
-        uint16_t touchNow = cap.touched();
-        i2cUnlock();
-        Serial.printf("[chip] ECR=0x%02X(run=%s,ele=%u) CFG1=0x%02X CFG2=0x%02X touched=0x%03X\n",
-                      ecrNow, (ecrNow & 0x3F) ? "yes" : "NO", ecrNow & 0x0F,
-                      cfg1Now, cfg2Now, touchNow);
-        Serial.printf("[bus] %lums: touchIters=%lu (%.1f/s) mprRead avg=%luus max=%luus | "
-                      "cst polls=%lu addrFail=%lu shortRead=%lu fingers=%lu | i2cRecov=%lu\n",
-                      (unsigned long)elapsed, (unsigned long)touchLoopIters,
-                      touchLoopIters * 1000.0f / elapsed,
-                      (unsigned long)avgUs, (unsigned long)mprReadUsMax,
-                      (unsigned long)cstPolls, (unsigned long)cstAddrFail,
-                      (unsigned long)cstShortRead, (unsigned long)cstFingers,
-                      (unsigned long)touchI2cRecoveryCount);
-        touchLoopIters = 0;
-        mprReads = 0; mprReadUsTotal = 0; mprReadUsMax = 0;
-        cstPolls = 0; cstAddrFail = 0; cstShortRead = 0; cstFingers = 0;
-      }
-    }
-#endif
-
-#ifdef SENS_TRACE
-    {
-      static uint32_t lastSens = 0;
-      if (millis() - lastSens >= 5000) {
-        lastSens = millis();
-        Serial.printf("[sens] t=%lus peak:", (unsigned long)(millis() / 1000));
-        for (uint8_t i = 0; i < NUM_ACTIVE_PADS; i++) {
-          uint8_t p = ACTIVE_PADS[i];
-          Serial.printf(" p%u=%d(%lu)", p, sensPeak[p], (unsigned long)sensLatches[p]);
-          sensPeak[p] = 0;
-        }
-        Serial.println();
-      }
-    }
-#endif
 
     vTaskDelayUntil(&lastWake, period);
   }
@@ -1586,11 +1376,12 @@ size_t formatTouchDiagnostics(char *out, size_t outLen) {
     uint16_t baseline = lastBaseline[pad];
     used += snprintf(out + used, outLen > used ? outLen - used : 0,
                      "%s{\"pad\":%u,\"filtered\":%u,\"baseline\":%u,\"delta\":%d,"
-                     "\"touched\":%s,\"ready\":%s}",
+                     "\"touched\":%s,\"ready\":%s",
                      i ? "," : "", pad, filtered, baseline,
                      (int)baseline - (int)filtered,
                      touchedState[pad] ? "true" : "false",
                      baselineReady[pad] ? "true" : "false");
+    used += snprintf(out + used, outLen > used ? outLen - used : 0, "}");
   }
   used += snprintf(out + used, outLen > used ? outLen - used : 0, "]");
   return used;
@@ -1602,9 +1393,16 @@ int16_t getTouchTouchDelta() { return TOUCH_DELTA; }
 // Runs on the main loop: applies one debounced press from the touch task.
 void handleTouchEvent(uint8_t pad) {
   lastActivityMs = millis();
+
+  // While the screen is blanked the first touch only wakes it - whatever was
+  // pressed is deliberately swallowed. Otherwise a press aimed at nothing but
+  // turning the display back on would also change the water level or toggle
+  // freeze protect, with the user unable to see what they were about to hit.
   if (!screenOn) {
     digitalWrite(GFX_BL, LOW); // wake: backlight is active-low
     screenOn = true;
+    updateStatsDisplay(); // repaint immediately rather than up to 1s later
+    return;
   }
 
   if (pad == TOUCH_EVENT_SCREEN) {
@@ -1641,6 +1439,9 @@ void setup() {
   Serial.setTxTimeoutMs(0);
   delay(10000);
   Serial.println("Setting up WaterController...");
+  if (esp_reset_reason() == ESP_RST_TASK_WDT) {
+    Serial.println("Restarted by the task watchdog: loop or touch task hung");
+  }
 
   loadEeprom();
   for (int i = 0; i < MAX_READING_SAMPLES; i++) {
@@ -1668,14 +1469,6 @@ void setup() {
   if (!mpr121Init()) {
     Serial.println("MPR121 not found on I2C bus (addr 0x5A) — check ADD pin wiring");
   }
-  // Build with -DMPR121_DIAGNOSTICS for a touch-wiring diagnostic image.
-  // This takes the device over completely: it dumps chip state, then monitors
-  // all 12 electrodes forever and never starts the display, radio, web portal
-  // or relay. Flash a normal build to restore operation.
-#ifdef MPR121_DIAGNOSTICS
-  mpr121DumpRegisters();
-  mpr121MonitorForever(); // never returns
-#endif
 
   if (!gfx->begin()) {
     Serial.println("gfx->begin() failed!");
@@ -1699,6 +1492,18 @@ void setup() {
 
   checkFilling();
 
+  // Replace the framework's default 5s watchdog config before any task
+  // subscribes. Idle-task checking stays off, as in the default: loop() runs
+  // continuously, so on this single-core chip the idle task rarely runs.
+  const esp_task_wdt_config_t wdtConfig = {
+      .timeout_ms = WATCHDOG_TIMEOUT_MS,
+      .idle_core_mask = 0,
+      .trigger_panic = true, // panic -> reboot, rather than just logging
+  };
+  if (esp_task_wdt_reconfigure(&wdtConfig) != ESP_OK) {
+    Serial.println("Failed to configure task watchdog");
+  }
+
   touchEventQueue = xQueueCreate(8, sizeof(uint8_t));
   if (touchEventQueue == nullptr) {
     Serial.println("Failed to create touch event queue");
@@ -1708,60 +1513,33 @@ void setup() {
     touchTaskHandle = nullptr;
   }
 
+  // The framework feeds the loop task's watchdog before every loop() call.
+  enableLoopWDT();
+
   Serial.println("WaterController ready");
 }
 
 void loop() {
 
-#ifdef LOOP_TRACE
-  // Times each blocking call in the loop. The touch queue is drained at the
-  // end of the loop, so anything slow here directly delays button response.
-  uint32_t tStart = millis();
-  static uint32_t worstIter = 0, iterCount = 0, lastLoopReport = 0;
-  uint32_t tMark = tStart, dRfm = 0, dWeb = 0, dAuto = 0, dMetric = 0,
-           dFill = 0, dDraw = 0, dTouch = 0;
-#define LOOP_MARK(var) do { uint32_t now = millis(); var = now - tMark; tMark = now; } while (0)
-#else
-#define LOOP_MARK(var) do { } while (0)
-#endif
-
-  // The once-a-second "loop tick" heartbeat that used to print here is gone:
-  // it was the main thing filling the USB CDC buffer when no monitor was
-  // attached. Build with -DLOOP_HEARTBEAT if you want it back for debugging.
-#ifdef LOOP_HEARTBEAT
-  static uint32_t lastLoopPrintMs = 0;
-  if (millis() - lastLoopPrintMs >= 1000UL) {
-    lastLoopPrintMs = millis();
-    Serial.println("WaterController loop tick");
-  }
-#endif
-
+  
   static uint32_t lastMetricUpdateMs = 0;
   static uint32_t lastCheckFillingMs = 0;
   static uint32_t lastStatsRedrawMs = 0;
 
   rfmPollReceive();
-  LOOP_MARK(dRfm);
 
-#ifndef NO_WIFI
   WebPortal::poll();
-#endif
-  LOOP_MARK(dWeb);
 
   checkAutoRestart();
-  LOOP_MARK(dAuto);
-
   if (millis() - lastMetricUpdateMs > METRIC_UPDATE_FREQ_MS) {
     lastMetricUpdateMs = millis();
     updateMetrics();
   }
-  LOOP_MARK(dMetric);
 
   if (millis() - lastCheckFillingMs > CHECK_FILLING_FREQ_MS) {
     lastCheckFillingMs = millis();
     checkFilling();
   }
-  LOOP_MARK(dFill);
 
   if (millis() - lastStatsRedrawMs > 1000) {
     lastStatsRedrawMs = millis();
@@ -1769,8 +1547,6 @@ void loop() {
       updateStatsDisplay();
     }
   }
-  LOOP_MARK(dDraw);
-
 
   // Touch sampling/debouncing happens in touchTask; drain whatever presses it
   // has queued since the last pass. Bounded so a burst can't stall the loop.
@@ -1780,34 +1556,6 @@ void loop() {
       handleTouchEvent(pad);
     }
   }
-  LOOP_MARK(dTouch);
-
-#ifdef LOOP_TRACE
-  {
-    uint32_t iter = millis() - tStart;
-    iterCount++;
-    if (iter > worstIter) {
-      worstIter = iter;
-    }
-    // Report the slowest iteration seen per window, plus where that time
-    // went. Anything here above ~100ms delays the touch drain by that much.
-    if (millis() - lastLoopReport >= 5000) {
-      uint32_t elapsed = millis() - lastLoopReport;
-      lastLoopReport = millis();
-      UBaseType_t queued = touchEventQueue ? uxQueueMessagesWaiting(touchEventQueue) : 0;
-      Serial.printf("[loop] %lums: iters=%lu (%.1f/s) worst=%lums | rfm=%lu web=%lu auto=%lu "
-                    "metric=%lu fill=%lu draw=%lu touch=%lu | queued=%u\n",
-                    (unsigned long)elapsed, (unsigned long)iterCount,
-                    iterCount * 1000.0f / elapsed, (unsigned long)worstIter,
-                    (unsigned long)dRfm, (unsigned long)dWeb, (unsigned long)dAuto,
-                    (unsigned long)dMetric, (unsigned long)dFill,
-                    (unsigned long)dDraw, (unsigned long)dTouch,
-                    (unsigned)queued);
-      worstIter = 0;
-      iterCount = 0;
-    }
-  }
-#endif
 
   if (wifiResetPendingUntilMs != 0 && millis() >= wifiResetPendingUntilMs) {
     wifiResetPendingUntilMs = 0; // confirm window elapsed with no second press - clear the banner
