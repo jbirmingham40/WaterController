@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "WebPortalPages.h"
+#include "RestartCause.h"
 #include "secrets.h" // SETTINGS_PASSWORD - gitignored, copy secrets.h.example to fill in
 
 // ===================== Shared state owned by main.cpp =====================
@@ -30,6 +31,11 @@ extern bool getFreezeProtectState();
 extern size_t formatTouchDiagnostics(char *out, size_t outLen);
 extern uint32_t getTouchI2cRecoveryCount();
 extern int16_t getTouchTouchDelta();
+extern size_t formatRadioDiagnostics(char *out, size_t outLen);
+extern esp_reset_reason_t bootResetReason;
+extern RestartCause bootRestartCause;
+extern const char *resetReasonName(esp_reset_reason_t reason);
+extern const char *restartCauseName(RestartCause cause);
 
 namespace WebPortal {
 
@@ -310,7 +316,10 @@ static void handleStatus(AsyncWebServerRequest *request) {
   char touchPads[832];
   formatTouchDiagnostics(touchPads, sizeof(touchPads));
 
-  char body[1664];
+  char radio[320];
+  formatRadioDiagnostics(radio, sizeof(radio));
+
+  char body[2048];
   snprintf(body, sizeof(body),
            "{\"wifiConnected\":%s,\"apActive\":%s,\"staSsid\":\"%s\",\"staIp\":\"%s\","
            "\"apIp\":\"%s\","
@@ -318,13 +327,15 @@ static void handleStatus(AsyncWebServerRequest *request) {
            "\"sensorPercentage\":%.1f,\"preferredWaterLevel\":%.1f,\"inFreezeProtect\":%s,"
            "\"isFilling\":%s,\"fillingPaused\":%s,\"lastHeardSecsAgo\":%ld,"
            "\"carbonHost\":\"%s\",\"carbonPort\":%u,\"uptimeMs\":%lu,"
-           "\"touchPads\":%s,\"touchDelta\":%d,\"touchI2cRecoveries\":%lu}",
+           "\"touchPads\":%s,\"touchDelta\":%d,\"touchI2cRecoveries\":%lu,"
+           "\"resetReason\":\"%s\",\"restartCause\":\"%s\",\"radio\":%s}",
            wifiConnected ? "true" : "false", apActive ? "true" : "false", jsonEscape(staSsid).c_str(),
            staIp.c_str(), apIp.c_str(), wifiTestStateName(), sensorWaterLevel, sensorVoltage, sensorPercentage,
            getPreferredWaterLevel(), getFreezeProtectState() ? "true" : "false", isFilling ? "true" : "false",
            fillingPaused ? "true" : "false", lastHeardSecsAgo, jsonEscape(carbonHost).c_str(), carbonPort,
            (unsigned long)millis(), touchPads, (int)getTouchTouchDelta(),
-           (unsigned long)getTouchI2cRecoveryCount());
+           (unsigned long)getTouchI2cRecoveryCount(), resetReasonName(bootResetReason),
+           restartCauseName(bootRestartCause), radio);
   request->send(200, "application/json", body);
 }
 
@@ -431,7 +442,7 @@ void poll() {
   serviceWifiConnectedEdge();
   serviceStaReconnect();
   if (rebootPending && millis() - rebootRequestedMs > REBOOT_DELAY_MS) {
-    ESP.restart();
+    restartWithCause(RESTART_CAUSE_WEB_REQUEST);
   }
 }
 
@@ -450,7 +461,7 @@ void resetWifiAndReboot() {
   prefs.remove("sta_ssid");
   prefs.remove("sta_pass");
   prefs.putBool("ap_confirmed", false);
-  ESP.restart();
+  restartWithCause(RESTART_CAUSE_WIFI_RESET);
 }
 
 } // namespace WebPortal

@@ -8,6 +8,7 @@
 #include "Adafruit_MPR121.h"
 #include <Arduino_GFX_Library.h>
 #include "WebPortal.h"
+#include "RestartCause.h"
 
 // ===================== WaterControllerV8 port: configurable settings =====================
 #define MAX_BATTERY_VOLTAGE 3.3f
@@ -47,9 +48,6 @@ static const int32_t METRIC_CONNECT_TIMEOUT_MS = 300;
 // it every updateMetrics() cycle pays the timeout on all 7 metrics.
 static const uint32_t METRIC_RETRY_BACKOFF_MS = 60000;
 static uint32_t metricNextConnectAttemptMs = 0;
-// Set once per updateMetrics() cycle if the connection is unusable, so the
-// remaining metrics in that cycle skip straight out instead of each retrying.
-static bool metricCycleFailed = false;
 
 // Resolve + connect if needed. Returns false (fast) when metrics can't be
 // sent right now. Called at the start of each updateMetrics() cycle.
@@ -94,9 +92,6 @@ bool metricsEnsureConnected() {
 }
 
 void sendMetric(const char *key, float value) {
-  if (metricCycleFailed || !metricsClient.connected()) {
-    return;
-  }
   char line[128];
   snprintf(line, sizeof(line), "%s %.2f %lu\n", key, value, (unsigned long)time(nullptr));
   if (metricsClient.print(line) == 0) {
@@ -104,7 +99,6 @@ void sendMetric(const char *key, float value) {
     // the rest of this cycle; the next cycle will reconnect.
     Serial.println("Metrics: write failed, dropping connection");
     metricsClient.stop();
-    metricCycleFailed = true;
   }
 }
 
@@ -300,17 +294,75 @@ void adjustDesiredWaterLevel(float delta) {
 // every 24h regardless) using simple software timers instead.
 unsigned long uptimeStartMs = millis();
 
+// RTC_NOINIT memory keeps its contents across ESP.restart() but is garbage
+// after a power cycle, so the cause is stored alongside its complement and
+// only trusted when the two still match.
+RTC_NOINIT_ATTR static uint32_t rtcRestartCause;
+RTC_NOINIT_ATTR static uint32_t rtcRestartCauseCheck;
+
+// What caused the current boot, captured once in setup().
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+RestartCause bootRestartCause = RESTART_CAUSE_NONE;
+
+void restartWithCause(RestartCause cause) {
+  rtcRestartCause = cause;
+  rtcRestartCauseCheck = ~(uint32_t)cause;
+  ESP.restart();
+  while (true) {
+  }
+}
+
+// Reads and clears the stored cause, so a later restart that doesn't go
+// through restartWithCause() (watchdog, crash) isn't misreported.
+static RestartCause takeStoredRestartCause() {
+  RestartCause cause = RESTART_CAUSE_NONE;
+  if (bootResetReason == ESP_RST_SW && rtcRestartCauseCheck == ~rtcRestartCause &&
+      rtcRestartCause <= RESTART_CAUSE_RADIO_INIT_FAILED) {
+    cause = (RestartCause)rtcRestartCause;
+  }
+  rtcRestartCause = RESTART_CAUSE_NONE;
+  rtcRestartCauseCheck = 0;
+  return cause;
+}
+
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+  case ESP_RST_POWERON: return "power_on";
+  case ESP_RST_EXT: return "external";
+  case ESP_RST_SW: return "software";
+  case ESP_RST_PANIC: return "panic";
+  case ESP_RST_INT_WDT: return "int_wdt";
+  case ESP_RST_TASK_WDT: return "task_wdt";
+  case ESP_RST_WDT: return "other_wdt";
+  case ESP_RST_DEEPSLEEP: return "deep_sleep";
+  case ESP_RST_BROWNOUT: return "brownout";
+  case ESP_RST_SDIO: return "sdio";
+  default: return "unknown";
+  }
+}
+
+const char *restartCauseName(RestartCause cause) {
+  switch (cause) {
+  case RESTART_CAUSE_SCHEDULED: return "scheduled";
+  case RESTART_CAUSE_SENSOR_SILENCE: return "sensor_silence";
+  case RESTART_CAUSE_WEB_REQUEST: return "web_request";
+  case RESTART_CAUSE_WIFI_RESET: return "wifi_reset";
+  case RESTART_CAUSE_RADIO_INIT_FAILED: return "radio_init_failed";
+  default: return "none";
+  }
+}
+
 void checkAutoRestart() {
   if (completedFirstSensorReading) {
     unsigned long minsSinceHeard = (millis() - lastHeardFromSensorTime) / 60000;
     if (minsSinceHeard > MAX_WAIT_WITHOUT_SENSOR_BEFORE_RESTART_MIN) {
       Serial.println("Restarting: haven't heard from sensor in too long");
-      ESP.restart();
+      restartWithCause(RESTART_CAUSE_SENSOR_SILENCE);
     }
   }
   if ((millis() - uptimeStartMs) / 60000 > AUTO_RESTART_TIME_MIN) {
     Serial.println("Restarting: scheduled 24h restart");
-    ESP.restart();
+    restartWithCause(RESTART_CAUSE_SCHEDULED);
   }
 }
 
@@ -453,6 +505,12 @@ static const UBaseType_t TOUCH_TASK_PRIORITY = 2; // above loopTask (priority 1)
 // that would outlast the scheduled 24h restart, which a hung loop can't reach
 // anyway.
 static const uint32_t WATCHDOG_TIMEOUT_MS = 60000;
+
+// Set in setup() when the last restart was the task watchdog. Reported as
+// autofill.controller.reset by updateMetrics(), then cleared once it has been
+// sent - Serial output is dropped with no monitor attached, so this is the
+// only way a watchdog restart in the field gets noticed.
+bool watchdogResetPending = false;
 
 // Most recent filtered reading per pad, and the tracked baseline it is being
 // compared against. Both are surfaced on /api/status so the pads' margin can
@@ -634,6 +692,23 @@ void rfmSetMode(uint8_t mode) {
 
 bool rfmReady = false;
 
+// Radio health since boot, surfaced on /api/status and as metrics so a deaf
+// radio can be told apart from a silent sensor without a serial monitor.
+uint32_t rfmInitFailures = 0;
+uint32_t rfmPacketsAccepted = 0;  // passed validation and updated the sensor state
+uint32_t rfmPacketsRejected = 0;  // CRC-valid but failed the range check in handleReceivedPacket
+uint32_t rfmPacketsMalformed = 0; // PayloadReady with an empty or too-short frame
+uint32_t rfmConfigLosses = 0;     // found reset to defaults (see rfmSampleRegisters) and re-inited
+int8_t rfmLastRssi = 0;
+unsigned long rfmLastPacketMs = 0; // any packet, accepted or not; 0 = none since boot
+
+// Register snapshot, refreshed from loop() by rfmSampleRegisters(). The web
+// server runs in its own task, so it reads these instead of touching the
+// bit-banged SPI bus while loop() may be mid-transfer.
+uint8_t rfmSnapOpMode = 0;
+uint8_t rfmSnapIrqFlags1 = 0;
+uint8_t rfmSnapIrqFlags2 = 0;
+
 bool rfmInit() {
   pinMode(RFM_SCLK, OUTPUT);
   pinMode(RFM_MOSI, OUTPUT);
@@ -755,9 +830,11 @@ void handleReceivedPacket(uint8_t senderId, uint8_t ctl, const WaterPayload &pay
   if (payload.batteryVoltage < 0 || payload.batteryVoltage > MAX_BATTERY_VOLTAGE ||
       payload.waterLevel < -1 || payload.waterLevel > HOLE_DEPTH) {
     Serial.println("Last sensor reading was bad. Ignoring.");
+    rfmPacketsRejected++;
     return;
   }
 
+  rfmPacketsAccepted++;
   lastHeardFromSensorTime = millis();
   completedFirstSensorReading = true;
   sensorVoltage = payload.batteryVoltage;
@@ -771,23 +848,36 @@ void handleReceivedPacket(uint8_t senderId, uint8_t ctl, const WaterPayload &pay
     Serial.printf("Sent ACK to node %d\n", senderId);
   }
 
+  checkFilling(); // before updateMetrics() so filling/paused reflect this reading
   updateMetrics();
-  checkFilling();
 }
 
 void updateMetrics() {
   // One connect attempt per cycle, not one per metric.
-  metricCycleFailed = !metricsEnsureConnected();
-  if (metricCycleFailed) {
+  if (!metricsEnsureConnected()) {
     return;
   }
   sendMetric("autofill.sensor.battery.voltage", sensorVoltage);
   sendMetric("autofill.sensor.battery.percentage", sensorPercentage);
   sendMetric("autofill.sensor.water_level", sensorWaterLevel);
   sendMetric("autofill.sensor.filling", isFilling ? 1.0f : 0.0f);
+  sendMetric("autofill.controller.filling_paused", fillingPaused ? 1.0f : 0.0f);
   sendMetric("autofill.controller.sensor_last_heard", (millis() - lastHeardFromSensorTime) / 1000.0f);
   sendMetric("autofill.controller.freeze_protect", eData.inFreezeProtect ? 1.0f : 0.0f);
-  sendMetric("autofill.controller.desired_water_level", eData.preferredWaterLevel);
+  sendMetric("autofill.controller.desired_water_level", eData.preferredWaterLevel); 
+  sendMetric("autofill.controller.reset", watchdogResetPending ? 1.0f : 0.0f);
+  watchdogResetPending = false; // sent - report it only once
+  // Constant for the whole boot, so a graph shows what caused each restart.
+  sendMetric("autofill.controller.reset_reason", (float)bootResetReason);
+  sendMetric("autofill.controller.restart_cause", (float)bootRestartCause);
+  sendMetric("autofill.controller.radio.ready", rfmReady ? 1.0f : 0.0f);
+  sendMetric("autofill.controller.radio.accepted", (float)rfmPacketsAccepted);
+  sendMetric("autofill.controller.radio.rejected", (float)rfmPacketsRejected);
+  sendMetric("autofill.controller.radio.malformed", (float)rfmPacketsMalformed);
+  sendMetric("autofill.controller.radio.config_losses", (float)rfmConfigLosses);
+  sendMetric("autofill.controller.radio.opmode", (float)rfmSnapOpMode);
+  sendMetric("autofill.controller.radio.irqflags1", (float)rfmSnapIrqFlags1);
+  sendMetric("autofill.controller.radio.irqflags2", (float)rfmSnapIrqFlags2);
 }
 
 // Polls IRQFLAGS2's PayloadReady bit instead of using DIO0, since that pin
@@ -816,7 +906,10 @@ void rfmPollReceive() {
   }
   digitalWrite(RFM_CS, HIGH);
 
+  rfmLastRssi = rssi;
+  rfmLastPacketMs = millis();
   if (len == 0) {
+    rfmPacketsMalformed++;
     return;
   }
 
@@ -836,7 +929,73 @@ void rfmPollReceive() {
     memcpy(&payload, &buf[HEADER_LEN], sizeof(payload));
 
     handleReceivedPacket(senderId, ctl, payload);
+  } else {
+    rfmPacketsMalformed++;
   }
+}
+
+// Switching the valve relay can glitch the RFM69's supply hard enough to
+// reset it while the ESP32 rides through. The chip then comes back in
+// standby with power-on defaults (sync word 0x01, AES off): VERSION still
+// reads fine, but it never receives again, and nothing noticed until the
+// 60-minute sensor-silence restart. Checking a register rfmInit() sets away
+// from its default, plus the RX mode, catches that within a second.
+void rfmSampleRegisters() {
+  if (!rfmReady) {
+    return;
+  }
+  rfmSnapOpMode = rfmReadReg(RFM_REG_OPMODE);
+  rfmSnapIrqFlags1 = rfmReadReg(RFM_REG_IRQFLAGS1);
+  rfmSnapIrqFlags2 = rfmReadReg(RFM_REG_IRQFLAGS2);
+
+  uint8_t sync1 = rfmReadReg(RFM_REG_SYNCVALUE1);
+  if (sync1 != 0x2D || (rfmSnapOpMode & 0x1C) != RFM_MODE_RX) {
+    Serial.printf("RFM69 lost its config (OPMODE=0x%02X SYNC1=0x%02X), re-initializing\n",
+                  rfmSnapOpMode, sync1);
+    rfmConfigLosses++;
+    rfmReady = rfmInit();
+    if (!rfmReady) {
+      rfmInitFailures++; // loop() retries via rfmRetryInitIfNeeded()
+    }
+  }
+}
+
+// rfmInit() used to run once in setup(). If it failed, the radio stayed down
+// with no visible sign, and since the sensor-silence restart only arms after
+// a first packet, nothing restarted the device until the 24h restart.
+static const uint32_t RFM_INIT_RETRY_MS = 10000;
+static const uint32_t RFM_INIT_FAILURES_BEFORE_RESTART = 6;
+
+void rfmRetryInitIfNeeded() {
+  static uint32_t nextRetryMs = 0;
+  if (rfmReady || millis() < nextRetryMs) {
+    return;
+  }
+  nextRetryMs = millis() + RFM_INIT_RETRY_MS;
+  rfmReady = rfmInit();
+  if (rfmReady) {
+    return;
+  }
+  rfmInitFailures++;
+  // Restart once to try a clean boot; if the radio was already failing
+  // before that restart, keep retrying instead of boot-looping.
+  if (rfmInitFailures >= RFM_INIT_FAILURES_BEFORE_RESTART && bootRestartCause != RESTART_CAUSE_RADIO_INIT_FAILED) {
+    Serial.println("Restarting: RFM69 init keeps failing");
+    restartWithCause(RESTART_CAUSE_RADIO_INIT_FAILED);
+  }
+}
+
+size_t formatRadioDiagnostics(char *out, size_t outLen) {
+  long lastPacketSecsAgo = rfmLastPacketMs == 0 ? -1 : (long)((millis() - rfmLastPacketMs) / 1000);
+  int n = snprintf(out, outLen,
+                   "{\"ready\":%s,\"initFailures\":%lu,\"configLosses\":%lu,\"accepted\":%lu,\"rejected\":%lu,"
+                   "\"malformed\":%lu,\"lastPacketSecsAgo\":%ld,\"lastRssi\":%d,"
+                   "\"opMode\":\"0x%02X\",\"irqFlags1\":\"0x%02X\",\"irqFlags2\":\"0x%02X\"}",
+                   rfmReady ? "true" : "false", (unsigned long)rfmInitFailures,
+                   (unsigned long)rfmConfigLosses, (unsigned long)rfmPacketsAccepted, (unsigned long)rfmPacketsRejected,
+                   (unsigned long)rfmPacketsMalformed, lastPacketSecsAgo, (int)rfmLastRssi,
+                   rfmSnapOpMode, rfmSnapIrqFlags1, rfmSnapIrqFlags2);
+  return n < 0 ? 0 : (size_t)n;
 }
 
 // ===================== Display (GFX) =====================
@@ -1439,8 +1598,13 @@ void setup() {
   Serial.setTxTimeoutMs(0);
   delay(10000);
   Serial.println("Setting up WaterController...");
-  if (esp_reset_reason() == ESP_RST_TASK_WDT) {
+  bootResetReason = esp_reset_reason();
+  bootRestartCause = takeStoredRestartCause();
+  Serial.printf("Reset reason: %s, restart cause: %s\n", resetReasonName(bootResetReason),
+                restartCauseName(bootRestartCause));
+  if (bootResetReason == ESP_RST_TASK_WDT) {
     Serial.println("Restarted by the task watchdog: loop or touch task hung");
+    watchdogResetPending = true;
   }
 
   loadEeprom();
@@ -1480,6 +1644,9 @@ void setup() {
   lastActivityMs = millis();
 
   rfmReady = rfmInit();
+  if (!rfmReady) {
+    rfmInitFailures++; // loop() retries via rfmRetryInitIfNeeded()
+  }
 
   // Build with -DNO_WIFI to leave WiFi and the web portal down. Touch
   // responsiveness degrades a few seconds after the AP comes up, and this
@@ -1526,6 +1693,7 @@ void loop() {
   static uint32_t lastCheckFillingMs = 0;
   static uint32_t lastStatsRedrawMs = 0;
 
+  rfmRetryInitIfNeeded();
   rfmPollReceive();
 
   WebPortal::poll();
@@ -1543,6 +1711,7 @@ void loop() {
 
   if (millis() - lastStatsRedrawMs > 1000) {
     lastStatsRedrawMs = millis();
+    rfmSampleRegisters();
     if (screenOn) {
       updateStatsDisplay();
     }
