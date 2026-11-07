@@ -21,12 +21,14 @@
 #define SENSOR_READING_UNKNOWN 99
 #define MAX_READING_SAMPLES 45
 #define MAX_READING_DEVIATION 0.5f
+#define FILL_NO_PROGRESS_TIMEOUT_MS (15UL * 60UL * 1000UL)
+#define MIN_FILL_PROGRESS_INCHES 0.1f
 #define CONTROLLER_NODE_ID 2 // matches WaterControllerV8.ino's CONTROLLER_NODE
 
-// Another device is currently the active controller acking the sensor; leave
-// this false until this board is the one actually deployed, to avoid two
-// controllers both acking the same sensor packet.
-bool radioAckEnabled = false;
+// This board is the deployed controller and acks the sensor. Set to false if
+// another controller takes over acking, so two boards don't both ack the same
+// sensor packet.
+bool radioAckEnabled = true;
 
 // ===================== WiFi =====================
 // AP provisioning, STA connect/confirm, and NTP sync are all owned by
@@ -194,19 +196,30 @@ unsigned long lastHeardFromSensorTime = millis();
 
 bool isFilling = false;
 bool fillingPaused = false; // true when checkFilling() is holding off because sensor readings look bad
+bool fillingPausedNoProgress = false; // latched until the operator changes a setting or toggles freeze protect
 unsigned long fillingStartTime = millis();
 unsigned long fillingEndTime = millis();
+float fillProgressReferenceLevel = -1.0f;
+unsigned long fillLastProgressTime = 0;
 
 float previousSensorReadings[MAX_READING_SAMPLES];
 
 void startFilling() {
+  if (isFilling) {
+    return;
+  }
   relaySet(true);
   isFilling = true;
   fillingStartTime = millis();
+  fillLastProgressTime = fillingStartTime;
+  fillProgressReferenceLevel = sensorWaterLevel >= 0.0f ? sensorWaterLevel : -1.0f;
   Serial.println("Start filling");
 }
 
 void stopFilling() {
+  if (!isFilling) {
+    return;
+  }
   relaySet(false);
   isFilling = false;
   fillingEndTime = millis();
@@ -227,10 +240,10 @@ bool checkPauseFilling() {
   float maxValue = sensorWaterLevel + MAX_READING_DEVIATION;
 
   for (int i = 0; i < MAX_READING_SAMPLES; i++) {
-    if (previousSensorReadings[i] < 0) {
-      return true; // invalid reading, pause filling
-    } else if (previousSensorReadings[i] == SENSOR_READING_UNKNOWN) {
+    if (previousSensorReadings[i] == SENSOR_READING_UNKNOWN) {
       return false; // reached unknown values, assume fine
+    } else if (previousSensorReadings[i] < 0) {
+      continue; // invalid readings are handled directly by checkFilling()
     } else if (previousSensorReadings[i] < minValue || previousSensorReadings[i] > maxValue) {
       return true; // deviated too far from the median
     }
@@ -239,25 +252,69 @@ bool checkPauseFilling() {
 }
 
 void checkFilling() {
+  // Freeze protection intentionally takes precedence over every sensor-based
+  // decision, including invalid readings and lack of observed progress.
   if (eData.inFreezeProtect) {
     startFilling();
     fillingPaused = false;
-  } else if (sensorWaterLevel == -1) {
-    stopFilling(); // haven't heard from sensor
-    fillingPaused = false;
-  } else if (checkPauseFilling()) { // has side effects (shifts previousSensorReadings) - call exactly once per checkFilling()
+    return;
+  }
+
+  if (sensorWaterLevel < 0.0f) {
     stopFilling();
     fillingPaused = true;
-  } else if (eData.preferredWaterLevel == 0) {
+    fillProgressReferenceLevel = -1.0f;
+    for (int i = 0; i < MAX_READING_SAMPLES; i++) {
+      previousSensorReadings[i] = SENSOR_READING_UNKNOWN;
+    }
+    Serial.println("Filling paused: invalid water-level reading");
+    return;
+  }
+
+  if (isFilling && millis() - lastHeardFromSensorTime >=
+                       (unsigned long)MAX_FILL_WITHOUT_SENSOR_TIME_MIN * 60000UL) {
+    stopFilling();
+    fillingPaused = false; // sensor silence is handled by the existing timeout
+    return;
+  }
+
+  if (fillingPausedNoProgress) {
+    stopFilling();
+    fillingPaused = true;
+    return;
+  }
+
+  if (checkPauseFilling()) { // has side effects (shifts previousSensorReadings) - call exactly once per checkFilling()
+    stopFilling();
+    fillingPaused = true;
+    return;
+  }
+
+  if (eData.preferredWaterLevel == 0) {
     stopFilling(); // lowest level = never fill
     fillingPaused = false;
-  } else if (isFilling) {
-    fillingPaused = false;
-    unsigned long minsSinceHeard = (millis() - lastHeardFromSensorTime) / 60000;
-    if (minsSinceHeard > MAX_FILL_WITHOUT_SENSOR_TIME_MIN) {
+    return;
+  }
+
+  if (isFilling) {
+    if (sensorWaterLevel >= eData.preferredWaterLevel) {
       stopFilling();
-    } else if (sensorWaterLevel >= eData.preferredWaterLevel) {
-      stopFilling();
+      fillingPaused = false;
+    } else {
+      if (fillProgressReferenceLevel < 0.0f) {
+        fillProgressReferenceLevel = sensorWaterLevel;
+        fillLastProgressTime = millis();
+      } else if (sensorWaterLevel >= fillProgressReferenceLevel + MIN_FILL_PROGRESS_INCHES) {
+        fillProgressReferenceLevel = sensorWaterLevel;
+        fillLastProgressTime = millis();
+      } else if (millis() - fillLastProgressTime >= FILL_NO_PROGRESS_TIMEOUT_MS) {
+        stopFilling();
+        fillingPaused = true;
+        fillingPausedNoProgress = true;
+        Serial.println("Filling paused: water level did not rise before timeout");
+      } else {
+        fillingPaused = false;
+      }
     }
   } else {
     fillingPaused = false;
@@ -272,11 +329,13 @@ void checkFilling() {
 // same way the up/down water-level pads toggle their own state.
 void toggleFreezeProtect() {
   eData.inFreezeProtect = !eData.inFreezeProtect;
+  fillingPausedNoProgress = false; // toggling freeze protect is an explicit operator reset
   saveEeprom();
   Serial.printf("Freeze protect %s\n", eData.inFreezeProtect ? "On" : "Off");
 }
 
 void adjustDesiredWaterLevel(float delta) {
+  fillingPausedNoProgress = false; // changing the target explicitly retries filling
   eData.preferredWaterLevel += delta;
   if (eData.preferredWaterLevel < 0) {
     eData.preferredWaterLevel = 0;
@@ -630,6 +689,8 @@ static const uint8_t RFM_RST = 9;
 #define RFM_REG_FRFLSB 0x09
 #define RFM_REG_VERSION 0x10
 #define RFM_REG_RXBW 0x19
+#define RFM_REG_PALEVEL 0x11
+#define RFM_REG_OCP 0x13
 #define RFM_REG_IRQFLAGS1 0x27
 #define RFM_REG_IRQFLAGS2 0x28
 #define RFM_REG_RSSIVALUE 0x24
@@ -771,6 +832,13 @@ bool rfmInit() {
   rfmWriteReg(RFM_REG_RSSITHRESH, 220);
   rfmWriteReg(RFM_REG_TESTDAGC, 0x30); // improved fading margin, matches LowPowerLab
 
+  // TX power. The chip's default routes output through PA0, which the HCW
+  // doesn't connect to the antenna - ACKs went out too weak to be heard. Use
+  // PA1+PA2 on PA_BOOST at +17dBm with OCP off, like LowPowerLab's
+  // setHighPower(). +17dBm needs no TESTPA high-power registers.
+  rfmWriteReg(RFM_REG_OCP, 0x0F);
+  rfmWriteReg(RFM_REG_PALEVEL, 0x40 | 0x20 | 0x1F);
+
   // AES-128 enabled with the transmitter's key: radio.encrypt("TOPSECRETPASSWRD")
   const char aesKey[] = "TOPSECRETPASSWRD"; // 16 chars + null terminator
   digitalWrite(RFM_CS, LOW);
@@ -826,7 +894,7 @@ struct WaterPayload {
 
 void updateMetrics();
 
-void handleReceivedPacket(uint8_t senderId, uint8_t ctl, const WaterPayload &payload) {
+void handleReceivedPacket(const WaterPayload &payload) {
   if (payload.batteryVoltage < 0 || payload.batteryVoltage > MAX_BATTERY_VOLTAGE ||
       payload.waterLevel < -1 || payload.waterLevel > HOLE_DEPTH) {
     Serial.println("Last sensor reading was bad. Ignoring.");
@@ -842,11 +910,6 @@ void handleReceivedPacket(uint8_t senderId, uint8_t ctl, const WaterPayload &pay
   sensorWaterLevel = payload.waterLevel;
   Serial.printf("Received an update from the sensor. voltage=%.2f waterLevel=%.2f\n",
                 sensorVoltage, sensorWaterLevel);
-
-  if (radioAckEnabled && (ctl & RFM_CTL_REQACK)) {
-    rfmSendAck(senderId);
-    Serial.printf("Sent ACK to node %d\n", senderId);
-  }
 
   checkFilling(); // before updateMetrics() so filling/paused reflect this reading
   updateMetrics();
@@ -913,22 +976,33 @@ void rfmPollReceive() {
     return;
   }
 
+  // LowPowerLab header: [targetID, senderID, CTLbyte], then the payload
+  static const uint8_t HEADER_LEN = 3;
+
+  // The sender only waits ~30ms for an ACK, so send it before any serial
+  // output, validation, or metrics work can eat into that window. A rejected
+  // reading is still acked - resending the same values wouldn't help.
+  bool ackSent = false;
+  if (radioAckEnabled && len >= HEADER_LEN && buf[0] == CONTROLLER_NODE_ID &&
+      (buf[2] & RFM_CTL_REQACK)) {
+    rfmSendAck(buf[1]);
+    ackSent = true;
+  }
+
   Serial.printf("RFM69 packet: len=%d rssi=%ddBm data=", len, rssi);
   for (uint8_t i = 0; i < len; i++) {
     Serial.printf("%02X ", buf[i]);
   }
   Serial.println();
+  if (ackSent) {
+    Serial.printf("Sent ACK to node %d\n", buf[1]);
+  }
 
-  // LowPowerLab header: [targetID, senderID, CTLbyte], then the payload
-  static const uint8_t HEADER_LEN = 3;
   if (len >= HEADER_LEN + sizeof(WaterPayload)) {
-    uint8_t senderId = buf[1];
-    uint8_t ctl = buf[2];
-
     WaterPayload payload;
     memcpy(&payload, &buf[HEADER_LEN], sizeof(payload));
 
-    handleReceivedPacket(senderId, ctl, payload);
+    handleReceivedPacket(payload);
   } else {
     rfmPacketsMalformed++;
   }
